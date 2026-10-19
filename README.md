@@ -25,7 +25,7 @@ Work is staged so each step is independently verifiable. See the
 **Foundations**
 - [x] #7 Scaffold project: package layout, pyproject, CLI stub
 - [x] #8 Video frame reader: ffmpeg decode + probe metadata
-- [ ] #11 Metadata schema v1: save/load JSON (video info + tracklets)
+- [x] #11 Metadata schema v1: save/load JSON (video info + tracklets)
 
 **Detection**
 - [ ] #9 Person detection: YOLO11n-pose per-frame boxes + keypoints
@@ -42,6 +42,14 @@ Work is staged so each step is independently verifiable. See the
 - [ ] #16 End-to-end CLI: video + prompt -> redacted video
 - [ ] #18 Selective rendering: only re-encode frames containing redactions
 - [ ] #19 Docs: usage, model choices, hardware notes
+
+## Development
+
+Run the test suite from the repo root:
+
+```bash
+python3 -m unittest
+```
 
 ## Hardware
 
