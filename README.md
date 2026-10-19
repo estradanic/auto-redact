@@ -38,7 +38,7 @@ Work is staged so each step is independently verifiable. See the
 - [ ] #14 Classifier v2: SigLIP2 zero-shot alternative
 
 **Rendering / integration**
-- [ ] #15 Render redacted video (full re-encode, draw black boxes)
+- [x] #15 Render redacted video (full re-encode, draw black boxes)
 - [ ] #16 End-to-end CLI: video + prompt -> redacted video
 - [ ] #18 Selective rendering: only re-encode frames containing redactions
 - [ ] #19 Docs: usage, model choices, hardware notes
