@@ -1,8 +1,8 @@
 """Command-line interface for auto-redact.
 
-One subcommand per pipeline stage (see README): ``render`` exists now
-(issue #15); track, classify and the end-to-end command (#16) come
-later.
+One subcommand per pipeline stage (see README): ``track`` (issues #9/#10)
+and ``render`` (issue #15) exist now; classify and the end-to-end
+command (#16) come later.
 """
 
 from __future__ import annotations
@@ -10,8 +10,9 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .meta import MetaError, load_meta
+from .meta import MetaError, load_meta, save_meta
 from .render import DEFAULT_CRF, DEFAULT_PRESET, RenderError, render_redacted
+from .track import build_tracklets
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -23,6 +24,46 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
+
+    track = commands.add_parser(
+        "track",
+        help="Detect people and associate them into per-person tracklets",
+        description=(
+            "Run YOLO11n-pose detection plus ByteTrack association over "
+            "the video, writing tracklet metadata (schema v1) for later "
+            "stages to consume."
+        ),
+    )
+    track.add_argument(
+        "--video",
+        required=True,
+        help="Path to the input video file",
+    )
+    track.add_argument(
+        "--meta",
+        required=True,
+        help="Path to write the tracklet metadata JSON",
+    )
+    track.add_argument(
+        "--stride",
+        "--sample-rate",
+        type=int,
+        default=1,
+        metavar="N",
+        dest="sample_rate",
+        help=(
+            "Process every Nth frame, aka stride "
+            "(default: 1, i.e. every frame)"
+        ),
+    )
+    track.add_argument(
+        "--device",
+        default="auto",
+        help=(
+            'Device for detection/tracking inference: "auto" (GPU if '
+            'available, else CPU), or a CUDA index like "0"'
+        ),
+    )
 
     render = commands.add_parser(
         "render",
@@ -57,6 +98,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _cmd_track(args: argparse.Namespace) -> int:
+    meta = build_tracklets(
+        args.video,
+        sample_rate=args.sample_rate,
+        device=args.device,
+    )
+    save_meta(args.meta, meta)
+    print(f"wrote {len(meta.tracklets)} tracklet(s) to {args.meta}")
+    return 0
+
+
 def _cmd_render(args: argparse.Namespace) -> int:
     meta = load_meta(args.meta)
     out = render_redacted(
@@ -70,6 +122,8 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "track":
+            return _cmd_track(args)
         if args.command == "render":
             return _cmd_render(args)
     except (MetaError, RenderError, FileNotFoundError, ValueError) as error:
