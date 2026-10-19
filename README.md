@@ -30,7 +30,7 @@ Work is staged so each step is independently verifiable. See the
 **Detection**
 - [ ] #9 Person detection: YOLO11n-pose per-frame boxes + keypoints
 - [ ] #10 Tracking: ByteTrack association into per-person tracklets
-- [ ] #12 Best snapshot selection v1: largest bbox per tracklet
+- [x] #12 Best snapshot selection v1: largest bbox per tracklet
 - [ ] #17 Better snapshot scoring using keypoints (visibility, head, occlusion)
 
 **Classification**
