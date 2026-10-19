@@ -34,6 +34,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--meta",
         help="Path to read/write tracklet metadata JSON (optional)",
     )
+    parser.add_argument(
+        "--sample-rate",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Process every Nth frame (default: 1, i.e. every frame)",
+    )
     return parser.parse_args(argv)
 
 

@@ -24,7 +24,7 @@ Work is staged so each step is independently verifiable. See the
 
 **Foundations**
 - [x] #7 Scaffold project: package layout, pyproject, CLI stub
-- [ ] #8 Video frame reader: ffmpeg decode + probe metadata
+- [x] #8 Video frame reader: ffmpeg decode + probe metadata
 - [ ] #11 Metadata schema v1: save/load JSON (video info + tracklets)
 
 **Detection**
