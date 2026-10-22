@@ -739,6 +739,7 @@ def _mux_audio(video: Path, source: Path, out: Path) -> None:
             "-map", "0:v:0",
             "-map", "1:a?",
             "-c", "copy",
+            "-movflags", "+faststart",
             str(out),
         ]
     )

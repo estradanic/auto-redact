@@ -160,7 +160,7 @@ def run_pipeline_streaming(
     min_track_frames=DEFAULT_MIN_TRACK_FRAMES,
     scene_cuts=True,
     scene_cut_threshold=0.45,
-    spill_threshold=100000,
+    spill_threshold=DEFAULT_SPILL_THRESHOLD,
     bookends=True,
     progress=lambda message: None,
     bar=lambda desc: contextlib.nullcontext(),
@@ -271,7 +271,7 @@ def run_pipeline_streaming(
     if has_audio:
         cmd += ["-map", "1:a:0", "-c:a", "copy"]
     cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset,
-            "-pix_fmt", "yuv420p", str(out)]
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out)]
     proc = None
     if not defer_render and not selective_stream:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
