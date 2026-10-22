@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-redact"
+version = "0.2.0"
+description = "AI-powered video redaction: redact people from videos based on a runtime-specified prompt"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Nicolas Estrada"}]
+keywords = ["video", "redaction", "computer-vision", "yolo", "ollama", "siglip"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "av",
+    "ultralytics>=8.4.182",
+    "opencv-python",
+    "numpy",
+    "pillow",
+    "torch",
+    "transformers",
+    "tqdm",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/estradanic/auto-redact"
+Repository = "https://github.com/estradanic/auto-redact"
+Issues = "https://github.com/estradanic/auto-redact/issues"
+
+[project.scripts]
+auto-redact = "auto_redact.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["auto_redact*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
