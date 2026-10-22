@@ -51,6 +51,7 @@ from .snapshot import (
     select_snapshots,
 )
 from .pipeline import run_pipeline, _classify_key
+from .streaming import run_pipeline_streaming
 from .track import build_tracklets
 from .scene import SceneError
 from .ui import progress_bar, setup_logging
@@ -729,6 +730,12 @@ def build_parser() -> argparse.ArgumentParser:
             "for a full re-encode with --crf/--preset applied everywhere"
         ),
     )
+    run.add_argument(
+        "--streaming",
+        action="store_true",
+        default=False,
+        help="Use the single-pass streaming pipeline (experimental)",
+    )
     _add_stability_args(run)
     _add_scene_args(run)
     for _p in (track, run):
@@ -785,6 +792,57 @@ def _resolve_out(out: str | Path, input_path: str | Path) -> Path:
 def _cmd_run(args: argparse.Namespace) -> int:
     setup_logging()
     out = _resolve_out(args.out, args.video)
+    if getattr(args, "streaming", False):
+        result = run_pipeline_streaming(
+            args.video,
+            args.prompt,
+            out,
+            meta_path=args.meta,
+            thumbs_dir=args.thumbs,
+            force=args.force,
+            sample_rate=args.sample_rate,
+            device=args.device,
+            track_workers=args.track_workers,
+            half=not args.no_half,
+            resume=not args.no_resume,
+            padding=args.padding,
+            isolate=args.isolate,
+            sub_isolate=args.sub_isolate,
+            closeup_area_fraction=args.closeup_area_fraction,
+            head_weight=args.head_weight,
+            body_weight=args.body_weight,
+            edge_penalty=args.edge_penalty,
+            edge_tolerance=args.edge_tolerance,
+            distractor_weight=args.distractor_weight,
+            same_person_iou=args.same_person_iou,
+            isolate_dilate=args.isolate_dilate,
+            classifier=args.classifier,
+            model=args.model,
+            threshold=args.threshold,
+            classify_device=args.classify_device,
+            ollama_url=args.ollama_url,
+            timeout=args.timeout,
+            classify_workers=args.classify_workers,
+            think=args.think,
+            max_image_size=args.max_image_size,
+            crf=args.crf,
+            preset=args.preset,
+            selective=args.selective,
+            encoder=args.encoder,
+            max_gap=args.max_gap,
+            smooth_window=args.smooth_window,
+            bridge_iou=args.bridge_iou,
+            min_track_frames=args.min_track_frames,
+            scene_cuts=args.scene_cuts,
+            scene_cut_threshold=args.scene_cut_threshold,
+            progress=lambda message: print(message, flush=True),
+            bar=progress_bar,
+        )
+        print(
+            f"{result['tracklets']} tracklet(s), {result['redacted']} redacted; "
+            f"wrote {result['out']}"
+        )
+        return 0
     summary = run_pipeline(
         args.video,
         args.prompt,
