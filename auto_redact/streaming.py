@@ -164,6 +164,11 @@ def run_pipeline_streaming(
     if model is None:
         model = DEFAULT_SIGLIP_MODEL if classifier == "siglip" else DEFAULT_MODEL
 
+    # Defer rendering (and frame buffering) when features that need a full pass
+    # are requested: orphan recovery and selective GOP copy. Decision-making
+    # (track + snapshot + classify) still happens in one pass.
+    defer_render = bool(orphans or selective)
+
     video = Path(video)
     out = Path(out)
     meta_file = Path(meta_path) if meta_path else out.with_name(out.stem + ".meta.json")
@@ -244,7 +249,9 @@ def run_pipeline_streaming(
         cmd += ["-map", "1:a:0", "-c:a", "copy"]
     cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset,
             "-pix_fmt", "yuv420p", str(out)]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    proc = None
+    if not defer_render:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     sub_model = None
     if sub_isolate:
@@ -470,73 +477,74 @@ def run_pipeline_streaming(
                 if frame_idx - at.last_frame > close_threshold:
                     close_and_classify(active.pop(tid))
 
-        # blockers for this frame
-        blockers = set()
-        for tid, at in active.items():
-            if at.closed:
-                continue
-            if at.first_frame <= frame_idx <= at.last_frame + max_gap:
-                blockers.add(at.internal_id)
-        frame_blockers[frame_idx] = blockers
+        if not defer_render:
+            # blockers for this frame
+            blockers = set()
+            for tid, at in active.items():
+                if at.closed:
+                    continue
+                if at.first_frame <= frame_idx <= at.last_frame + max_gap:
+                    blockers.add(at.internal_id)
+            frame_blockers[frame_idx] = blockers
 
-        # store frame
-        store_frame(frame_idx, frame_rgb)
+            # store frame
+            store_frame(frame_idx, frame_rgb)
 
-        # ship eligible
-        while next_ship[0] in frame_buffer:
-            idx = next_ship[0]
-            if frame_blockers.get(idx):
-                break
-            arr = load_frame(idx)
-            if arr is None:
-                break
-            # paint
-            for box in render_boxes.get(idx, []):
-                cv2.rectangle(arr, (box[0], box[1]), (box[2], box[3]), (0, 0, 0), thickness=-1)
-            try:
-                proc.stdin.write(arr.tobytes())
-            except BrokenPipeError:
-                break
-            # remove from buffer
-            v = frame_buffer.pop(idx, None)
-            if isinstance(v, Path):
+            # ship eligible
+            while next_ship[0] in frame_buffer:
+                idx = next_ship[0]
+                if frame_blockers.get(idx):
+                    break
+                arr = load_frame(idx)
+                if arr is None:
+                    break
+                # paint
+                for box in render_boxes.get(idx, []):
+                    cv2.rectangle(arr, (box[0], box[1]), (box[2], box[3]), (0, 0, 0), thickness=-1)
                 try:
-                    v.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            in_memory_count[0] = max(0, in_memory_count[0] - (0 if isinstance(v, Path) else 1))
-            next_ship[0] += 1
+                    proc.stdin.write(arr.tobytes())
+                except BrokenPipeError:
+                    break
+                # remove from buffer
+                v = frame_buffer.pop(idx, None)
+                if isinstance(v, Path):
+                    try:
+                        v.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                in_memory_count[0] = max(0, in_memory_count[0] - (0 if isinstance(v, Path) else 1))
+                next_ship[0] += 1
 
     # end: close all remaining active
     for tid in list(active.keys()):
         close_and_classify(active.pop(tid))
 
-    # ship remaining buffered frames
-    while next_ship[0] < info.frame_count:
-        idx = next_ship[0]
-        if idx in frame_buffer or idx < info.frame_count:
-            if idx in frame_buffer:
-                arr = load_frame(idx)
-                if arr is not None:
-                    for box in render_boxes.get(idx, []):
-                        cv2.rectangle(arr, (box[0], box[1]), (box[2], box[3]), (0, 0, 0), thickness=-1)
-                    try:
-                        proc.stdin.write(arr.tobytes())
-                    except BrokenPipeError:
-                        pass
-                    v = frame_buffer.pop(idx, None)
-                    if isinstance(v, Path):
-                        try: v.unlink(missing_ok=True)
-                        except Exception: pass
+    if not defer_render:
+        # ship remaining buffered frames
+        while next_ship[0] < info.frame_count:
+            idx = next_ship[0]
+            if idx in frame_buffer or idx < info.frame_count:
+                if idx in frame_buffer:
+                    arr = load_frame(idx)
+                    if arr is not None:
+                        for box in render_boxes.get(idx, []):
+                            cv2.rectangle(arr, (box[0], box[1]), (box[2], box[3]), (0, 0, 0), thickness=-1)
+                        try:
+                            proc.stdin.write(arr.tobytes())
+                        except BrokenPipeError:
+                            pass
+                        v = frame_buffer.pop(idx, None)
+                        if isinstance(v, Path):
+                            try: v.unlink(missing_ok=True)
+                            except Exception: pass
             next_ship[0] += 1
-        else:
-            break
 
-    try:
-        proc.stdin.close()
-    except Exception:
-        pass
-    proc.wait()
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        if proc is not None:
+            proc.wait()
 
     # build metadata
     tracklets = []
@@ -558,6 +566,56 @@ def run_pipeline_streaming(
         save_meta(meta_file, meta)
     except Exception:
         pass
+
+    # Orphan recovery + deferred render (selective / orphans) support.
+    if orphans:
+        from .track import add_orphan_tracklets
+
+        meta = add_orphan_tracklets(meta, video, on_progress=None)
+        from .snapshot import select_snapshots
+
+        select_snapshots(
+            meta,
+            thumbs_dir=thumbs,
+            padding=padding,
+            isolate=isolate,
+            sub_isolate=sub_isolate,
+            closeup_area_fraction=closeup_area_fraction,
+            head_weight=head_weight,
+            body_weight=body_weight,
+            edge_penalty=edge_penalty,
+            edge_tolerance=edge_tolerance,
+            distractor_weight=distractor_weight,
+            same_person_iou=same_person_iou,
+            isolate_dilate=isolate_dilate,
+            contact_sheet=DEFAULT_CONTACT_SHEET,
+            resume=True,
+            meta_path=meta_file,
+        )
+        from .classify import classify_snapshots as _classify
+
+        if classifier == "siglip":
+            _classify(meta, prompt, classifier=siglip, resume=True, meta_path=meta_file)
+        else:
+            _classify(
+                meta, prompt, model=model, ollama_url=ollama_url, timeout=timeout,
+                workers=classify_workers, think=think, max_image_size=max_image_size,
+                resume=True, meta_path=meta_file,
+            )
+        try:
+            save_meta(meta_file, meta)
+        except Exception:
+            pass
+
+    if defer_render:
+        from .render import render_redacted
+
+        render_redacted(
+            meta, out, crf=crf, preset=preset, selective=selective, encoder=encoder,
+            max_gap=max_gap, smooth_window=smooth_window, bridge_iou=bridge_iou,
+            min_track_frames=min_track_frames, on_progress=None,
+        )
+
     # sidecar
     key = {"prompt": prompt.strip(), "model": model}
     if classifier == "siglip":
@@ -586,6 +644,6 @@ def run_pipeline_streaming(
     except Exception:
         pass
 
-    redacted = sum(1 for t in tracklets if t.redact)
-    progress(f"{len(tracklets)} tracklet(s), {redacted} redacted; wrote {out}")
-    return {"out": out, "meta_path": meta_file, "tracklets": len(tracklets), "redacted": redacted}
+    redacted = sum(1 for t in meta.tracklets if t.redact)
+    progress(f"{len(meta.tracklets)} tracklet(s), {redacted} redacted; wrote {out}")
+    return {"out": out, "meta_path": meta_file, "tracklets": len(meta.tracklets), "redacted": redacted}
