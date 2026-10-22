@@ -53,6 +53,12 @@ from .render import (
     _fill_tracklet_gaps,
     _smooth_boxes,
     redaction_boxes,
+    _Segment,
+    _copy_segment,
+    _encode_segment,
+    _concat_video,
+    _mux_audio,
+    _keyframe_table,
 )
 from .scene import _frame_hist
 from .siglip import DEFAULT_SIGLIP_MODEL, DEFAULT_THRESHOLD, SiglipClassifier
@@ -167,7 +173,7 @@ def run_pipeline_streaming(
     # Defer rendering (and frame buffering) when features that need a full pass
     # are requested: orphan recovery and selective GOP copy. Decision-making
     # (track + snapshot + classify) still happens in one pass.
-    defer_render = bool(orphans or selective)
+    defer_render = bool(orphans)
 
     video = Path(video)
     out = Path(out)
@@ -178,6 +184,23 @@ def run_pipeline_streaming(
 
     info = probe_video(video)
     device = _select_device(device)
+
+    selective_stream = False
+    gops = []
+    gop_frames = {}
+    gop_blockers = {}
+    shipped_gops = set()
+    segments = []
+    keyframes = {}
+    is_open_gop = False
+    if selective and not defer_render:
+        keyframes, is_open_gop = _keyframe_table(video)
+        if keyframes and not is_open_gop and 0 in keyframes:
+            selective_stream = True
+            boundaries = sorted({0, info.frame_count} | set(keyframes))
+            gops = [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1) if boundaries[i + 1] > boundaries[i]]
+        else:
+            selective_stream = False
     half = half and device.startswith("cuda")
 
     # classifier instance
@@ -250,7 +273,7 @@ def run_pipeline_streaming(
     cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset,
             "-pix_fmt", "yuv420p", str(out)]
     proc = None
-    if not defer_render:
+    if not defer_render and not selective_stream:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     sub_model = None
@@ -367,6 +390,9 @@ def run_pipeline_streaming(
         for idx in list(frame_blockers.keys()):
             if at.internal_id in frame_blockers[idx]:
                 frame_blockers[idx].discard(at.internal_id)
+        # unblock GOPs (selective streaming)
+        for gs in list(gop_blockers.keys()):
+            gop_blockers[gs].discard(at.internal_id)
 
     # bookend pass: track first and last chunks quickly to classify boundary tracklets early.
     # We implement by simply running the main loop over the whole video; bookends toggle
@@ -477,7 +503,44 @@ def run_pipeline_streaming(
                 if frame_idx - at.last_frame > close_threshold:
                     close_and_classify(active.pop(tid))
 
-        if not defer_render:
+        def _gop_start_of(fidx):
+            for gs, ge in gops:
+                if gs <= fidx < ge:
+                    return gs
+            return gops[-1][0] if gops else 0
+
+        if selective_stream:
+            gs = _gop_start_of(frame_idx)
+            gop_frames.setdefault(gs, []).append((frame_idx, frame_rgb))
+            # track blockers for this GOP
+            blockers = gop_blockers.setdefault(gs, set())
+            for tid, at in active.items():
+                if at.closed:
+                    continue
+                if at.first_frame <= frame_idx <= at.last_frame + max_gap:
+                    blockers.add(at.internal_id)
+            # try to ship fully-buffered GOPs in order
+            for gstart, gend in gops:
+                if gstart in shipped_gops:
+                    continue
+                if gend > frame_idx + 1:
+                    break
+                if gop_blockers.get(gstart):
+                    break
+                # ship this GOP
+                frames = gop_frames.pop(gstart, [])
+                edited = any(idx in render_boxes for idx, _ in frames)
+                seg = _Segment(gstart, gend, edited)
+                seg_path = Path(tempfile.mkdtemp(prefix="auto-redact-gop-")) / f"gop_{gstart:06d}.mp4"
+                # reuse a single temp dir? use spill_dir
+                seg_path = spill_dir / f"gop_{gstart:06d}.mp4"
+                if edited:
+                    _encode_segment(video, seg_path, render_boxes, keyframes, seg, info, crf, preset, encoder)
+                else:
+                    _copy_segment(video, seg_path, keyframes, seg)
+                segments.append(seg_path)
+                shipped_gops.add(gstart)
+        elif not defer_render:
             # blockers for this frame
             blockers = set()
             for tid, at in active.items():
@@ -519,7 +582,7 @@ def run_pipeline_streaming(
     for tid in list(active.keys()):
         close_and_classify(active.pop(tid))
 
-    if not defer_render:
+    if (not defer_render) and (not selective_stream):
         # ship remaining buffered frames
         while next_ship[0] < info.frame_count:
             idx = next_ship[0]
@@ -545,6 +608,26 @@ def run_pipeline_streaming(
             pass
         if proc is not None:
             proc.wait()
+
+    if selective_stream:
+        # ship any remaining GOPs
+        for gstart, gend in gops:
+            if gstart in shipped_gops:
+                continue
+            gop_blockers.get(gstart, set()).clear()
+            frames = gop_frames.pop(gstart, [])
+            edited = any(idx in render_boxes for idx, _ in frames)
+            seg = _Segment(gstart, gend, edited)
+            seg_path = spill_dir / f"gop_{gstart:06d}.mp4"
+            if edited:
+                _encode_segment(video, seg_path, render_boxes, keyframes, seg, info, crf, preset, encoder)
+            else:
+                _copy_segment(video, seg_path, keyframes, seg)
+            segments.append(seg_path)
+            shipped_gops.add(gstart)
+        joined = spill_dir / "joined.mp4"
+        _concat_video(segments, joined)
+        _mux_audio(joined, video, out)
 
     # build metadata
     tracklets = []
