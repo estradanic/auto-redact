@@ -28,6 +28,24 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
 
+`pip install -e .` only installs into the active virtualenv, so `auto-redact` is
+only on `PATH` while that venv is activated. To make it available from any
+shell without activating the venv, symlink the entry point into a directory on
+your `PATH` (e.g. `~/.local/bin`, which is on `PATH` by default on most
+distros):
+
+```bash
+ln -s "$(pwd)/.venv/bin/auto-redact" ~/.local/bin/auto-redact
+auto-redact --version
+```
+
+This reuses the existing venv (no extra downloads) and persists across reboots.
+If you'd rather have a fully isolated install, use `pipx`:
+
+```bash
+pipx install /path/to/auto-redact
+```
+
 Model weights download on first use (YOLO11n-pose, and SigLIP2 if you use it). The default
 classifier also needs [ollama](https://ollama.com) running locally with a vision model:
 
