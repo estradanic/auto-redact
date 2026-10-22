@@ -60,6 +60,7 @@ from .render import (
     _mux_audio,
     _keyframe_table,
 )
+from .pipeline import _classify_key
 from .scene import _frame_hist
 from .siglip import DEFAULT_SIGLIP_MODEL, DEFAULT_THRESHOLD, SiglipClassifier
 from .snapshot import (
@@ -81,7 +82,7 @@ from .snapshot import (
     sub_isolate_people,
     write_contact_sheet,
 )
-from .track import _select_device, _load_yolo, _extract, _iou
+from .track import _select_device, _load_yolo, _extract, _iou, _same_video
 
 
 # Reuse the same defaults as the classic pipeline where sensible.
@@ -184,6 +185,23 @@ def run_pipeline_streaming(
 
     info = probe_video(video)
     device = _select_device(device)
+
+    # Reuse cached result if available (mirrors classic pipeline).
+    if (not force) and meta_file.is_file() and out.is_file():
+        try:
+            loaded = load_meta(meta_file)
+        except MetaError:
+            loaded = None
+        if loaded is not None and _same_video(loaded, video, info):
+            key = _classify_key(prompt, classifier, model, threshold, think)
+            try:
+                stored = json.loads(sidecar.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                stored = None
+            if stored == key and all(t.redact is not None for t in loaded.tracklets):
+                progress("reusing cached result")
+                redacted = sum(1 for t in loaded.tracklets if t.redact)
+                return {"out": out, "meta_path": meta_file, "tracklets": len(loaded.tracklets), "redacted": redacted}
 
     selective_stream = False
     gops = []
