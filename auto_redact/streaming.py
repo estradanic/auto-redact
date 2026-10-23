@@ -49,8 +49,10 @@ from .render import (
     DEFAULT_PRESET,
     DEFAULT_SMOOTH_WINDOW,
     ENCODERS,
+    _box_iou,
     _clamp_box,
     _fill_tracklet_gaps,
+    _lerp_box,
     _smooth_boxes,
     redaction_boxes,
     _Segment,
@@ -254,6 +256,8 @@ def run_pipeline_streaming(
 
     # render boxes accumulated as tracklets close
     render_boxes: dict[int, list[tuple[int, int, int, int]]] = {}
+    closed_redacted: list[_Active] = []
+    unblock_at: dict[int, set[int]] = {}
 
     # frame buffer: idx -> ndarray or Path (spilled)
     frame_buffer: dict[int, Any] = {}
@@ -397,6 +401,23 @@ def run_pipeline_streaming(
                 if pb is not None:
                     render_boxes.setdefault(f, []).append(pb)
 
+            # Bridging: interpolate seams with already-closed redacted tracklets.
+            if bridge_iou > 0 and max_gap > 0:
+                for prev in closed_redacted:
+                    gap = at.first_frame - prev.last_frame - 1
+                    if not (0 < gap <= max_gap):
+                        continue
+                    if _box_iou(prev.boxes[-1], at.boxes[0]) < bridge_iou:
+                        continue
+                    for step in range(1, gap + 1):
+                        t = step / (gap + 1)
+                        box = _lerp_box(prev.boxes[-1], at.boxes[0], t)
+                        frame_idx = prev.last_frame + step
+                        pb = _clamp_box(box, w, h)
+                        if pb is not None:
+                            render_boxes.setdefault(frame_idx, []).append(pb)
+            closed_redacted.append(at)
+
         closed_tracklets.append(at)
         redact_by_id[at.internal_id] = redact
         score_by_id[at.internal_id] = score
@@ -404,13 +425,17 @@ def run_pipeline_streaming(
         isolated_by_id[at.internal_id] = isolated_ids
         best_frame_by_id[at.internal_id] = at.best_frame
 
-        # unblock frames
-        for idx in list(frame_blockers.keys()):
-            if at.internal_id in frame_blockers[idx]:
-                frame_blockers[idx].discard(at.internal_id)
-        # unblock GOPs (selective streaming)
-        for gs in list(gop_blockers.keys()):
-            gop_blockers[gs].discard(at.internal_id)
+        # Schedule unblock (hold for bridging window) instead of immediate.
+        if max_gap > 0:
+            unblock_frame = at.last_frame + max_gap + 1
+            unblock_at.setdefault(unblock_frame, set()).add(at.internal_id)
+        else:
+            # unblock now
+            for idx in list(frame_blockers.keys()):
+                if at.internal_id in frame_blockers[idx]:
+                    frame_blockers[idx].discard(at.internal_id)
+            for gs in list(gop_blockers.keys()):
+                gop_blockers[gs].discard(at.internal_id)
 
     # bookend pass: track first and last chunks quickly to classify boundary tracklets early.
     # We implement by simply running the main loop over the whole video; bookends toggle
@@ -527,6 +552,15 @@ def run_pipeline_streaming(
                     return gs
             return gops[-1][0] if gops else 0
 
+        # process scheduled unblocks (bridging hold)
+        if frame_idx in unblock_at:
+            for tid in unblock_at.pop(frame_idx):
+                for idx in list(frame_blockers.keys()):
+                    if tid in frame_blockers[idx]:
+                        frame_blockers[idx].discard(tid)
+                for gs in list(gop_blockers.keys()):
+                    gop_blockers[gs].discard(tid)
+
         if selective_stream:
             gs = _gop_start_of(frame_idx)
             gop_frames.setdefault(gs, []).append((frame_idx, frame_rgb))
@@ -626,6 +660,16 @@ def run_pipeline_streaming(
             pass
         if proc is not None:
             proc.wait()
+
+    # release any remaining scheduled unblocks
+    for tids in unblock_at.values():
+        for tid in tids:
+            for idx in list(frame_blockers.keys()):
+                if tid in frame_blockers[idx]:
+                    frame_blockers[idx].discard(tid)
+            for gs in list(gop_blockers.keys()):
+                gop_blockers[gs].discard(tid)
+    unblock_at.clear()
 
     if selective_stream:
         # ship any remaining GOPs
