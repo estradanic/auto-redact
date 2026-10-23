@@ -21,6 +21,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import queue as _queue
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, ContextManager
@@ -84,6 +85,10 @@ from .snapshot import (
     sub_isolate_people,
     write_contact_sheet,
 )
+try:
+    import torch as _torch
+except Exception:
+    _torch = None
 from .track import _select_device, _load_yolo, _extract, _iou, _same_video
 
 
@@ -189,6 +194,20 @@ def run_pipeline_streaming(
 
     info = probe_video(video)
     device = _select_device(device)
+
+    _gpu_lock = threading.Lock()
+    _state_lock = threading.Lock()
+
+    def _manage_vram(tag=""):
+        if _torch is not None and _torch.cuda.is_available():
+            try:
+                alloc = _torch.cuda.memory_allocated() / (1024**3)
+                total = _torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                if alloc > 0.85 * total:
+                    progress(f"      VRAM high ({tag}): {alloc:.1f}/{total:.1f} GB")
+                _torch.cuda.synchronize()
+            except Exception:
+                pass
 
     # Reuse cached result if available (mirrors classic pipeline).
     if (not force) and meta_file.is_file() and out.is_file():
@@ -455,121 +474,177 @@ def run_pipeline_streaming(
             return np.load(v)
         return v
 
-    def close_and_classify(at: _Active):
+    # Async classification setup.
+    classify_queue = _queue.Queue()
+    classified_ids = set()
+    tracklet_by_id = {}
+    pending_results = {}
+    _finalized_ids = set()
+
+    def _classify_one(at):
+        """Worker: decode best frame, crop, isolate, classify. Runs in background."""
+        redact = None
+        score = None
+        snap_path = None
+        isolated_ids = []
+        try:
+            if at.best_box is not None and at.best_frame is not None:
+                best_arr = None
+                for fi, fr in iter_frames(video, start=at.best_frame, stop=at.best_frame + 1):
+                    best_arr = fr
+                    break
+                if best_arr is not None:
+                    try:
+                        crop = crop_snapshot(best_arr, at.best_box, padding)
+                    except Exception:
+                        crop = None
+                    if crop is not None:
+                        from .snapshot import _padded_crop_window, _clamped_area
+                        window = _padded_crop_window(at.best_box, w, h, padding)
+                        area_fraction = _clamped_area(at.best_box, w, h) / max(1.0, float(w) * float(h))
+                        closeup = area_fraction >= closeup_area_fraction
+                        if isolate and not closeup:
+                            crop, painted = redact_others(
+                                crop, window, at.best_box, at.best_others,
+                                same_person_iou=same_person_iou, dilate=isolate_dilate,
+                            )
+                            isolated_ids = painted
+                        if sub_isolate and sub_model is not None and not closeup:
+                            with _gpu_lock:
+                                sub_isolate_people(crop, window, at.best_box, sub_model, dilate=isolate_dilate)
+                                _manage_vram("sub_isolate")
+                        image = Image.fromarray(crop)
+                        thumb_path = thumbs / f"track_{at.internal_id}.jpg"
+                        image.save(thumb_path, format="JPEG", quality=90)
+                        snap_path = str(thumb_path)
+
+                        # Classify (GPU lock, since ollama/VLM or SigLIP use GPU).
+                        with _gpu_lock:
+                            if classifier == "siglip":
+                                dec = siglip.classify(snap_path, prompt)
+                            else:
+                                clf = make_vlm()
+                                dec = clf.classify(snap_path, prompt)
+                            _manage_vram("classify")
+                        redact = dec.redact
+                        score = dec.score
+        except Exception:
+            redact = None
+            score = None
+
+        with _state_lock:
+            pending_results[at.internal_id] = (redact, score, snap_path, isolated_ids)
+            classified_ids.add(at.internal_id)
+
+    def _classify_worker():
+        while True:
+            at = classify_queue.get()
+            if at is None:
+                classify_queue.task_done()
+                break
+            try:
+                _classify_one(at)
+            except Exception:
+                with _state_lock:
+                    pending_results[at.internal_id] = (None, None, None, [])
+                    classified_ids.add(at.internal_id)
+            finally:
+                classify_queue.task_done()
+
+    _worker_thread = threading.Thread(target=_classify_worker, daemon=True)
+    _worker_thread.start()
+
+    def close_tracklet(at: _Active):
         nonlocal next_internal_id
         if at.closed:
             return
         at.closed = True
-        redact = None
-        score = None
-        snap_path = None
-        isolated_ids: list[int] = []
-
-        if at.best_box is not None and at.best_frame is not None:
-            best_arr = None
-            for fi, fr in iter_frames(video, start=at.best_frame, stop=at.best_frame + 1):
-                best_arr = fr
-                break
-            if best_arr is not None:
-                try:
-                    crop = crop_snapshot(best_arr, at.best_box, padding)
-                except Exception:
-                    crop = None
-                if crop is not None:
-                    from .snapshot import _padded_crop_window, _clamped_area
-                    window = _padded_crop_window(at.best_box, w, h, padding)
-                    area_fraction = _clamped_area(at.best_box, w, h) / max(1.0, float(w) * float(h))
-                    closeup = area_fraction >= closeup_area_fraction
-                    if isolate and not closeup:
-                        crop, painted = redact_others(
-                            crop, window, at.best_box, at.best_others,
-                            same_person_iou=same_person_iou, dilate=isolate_dilate,
-                        )
-                        isolated_ids = painted
-                    if sub_isolate and sub_model is not None and not closeup:
-                        sub_isolate_people(crop, window, at.best_box, sub_model, dilate=isolate_dilate)
-                    image = Image.fromarray(crop)
-                    thumb_path = thumbs / f"track_{at.internal_id}.jpg"
-                    image.save(thumb_path, format="JPEG", quality=90)
-                    snap_path = str(thumb_path)
-
-                    # classify
-                    if classifier == "siglip":
-                        dec = siglip.classify(snap_path, prompt)
-                    else:
-                        clf = make_vlm()
-                        dec = clf.classify(snap_path, prompt)
-                    redact = dec.redact
-                    score = dec.score
-
-        # compute render boxes if redacted
-        if redact is True:
-            filled_frames, filled_boxes = _fill_tracklet_gaps(at.frames, at.boxes, max_gap)
-            if smooth_window > 1 and len(filled_boxes) > 1:
-                filled_boxes = _smooth_boxes(filled_frames, filled_boxes, smooth_window)
-            for f, box in zip(filled_frames, filled_boxes):
-                pb = _clamp_box(box, w, h)
-                if pb is not None:
-                    render_boxes.setdefault(f, []).append(pb)
-
-            # Bridging: interpolate seams with already-closed redacted tracklets.
-            if bridge_iou > 0 and max_gap > 0:
-                for prev in closed_redacted:
-                    gap = at.first_frame - prev.last_frame - 1
-                    if not (0 < gap <= max_gap):
-                        continue
-                    if _box_iou(prev.boxes[-1], at.boxes[0]) < bridge_iou:
-                        continue
-                    for step in range(1, gap + 1):
-                        t = step / (gap + 1)
-                        box = _lerp_box(prev.boxes[-1], at.boxes[0], t)
-                        frame_idx = prev.last_frame + step
-                        pb = _clamp_box(box, w, h)
-                        if pb is not None:
-                            render_boxes.setdefault(frame_idx, []).append(pb)
-            closed_redacted.append(at)
-
+        tracklet_by_id[at.internal_id] = at
         closed_tracklets.append(at)
-        # Periodic meta write so progress is inspectable mid-run.
-        try:
-            _tmp_tracklets = []
-            for _at in sorted(closed_tracklets, key=lambda a: a.internal_id):
-                _tmp_tracklets.append(Tracklet(
-                    track_id=_at.internal_id,
-                    frames=list(_at.frames),
-                    boxes=[list(b) for b in _at.boxes],
-                    keypoints=[list(k) for k in _at.keypoints],
-                    best_frame=best_frame_by_id.get(_at.internal_id),
-                    best_snapshot_path=snapshot_path_by_id.get(_at.internal_id),
-                    isolated_track_ids=list(isolated_by_id.get(_at.internal_id, [])),
-                    redact=redact_by_id.get(_at.internal_id),
-                    score=score_by_id.get(_at.internal_id),
-                ))
-            save_meta(meta_file, Metadata(video=VideoInfo(path=str(video), fps=fps, width=w, height=h, frames=info.frame_count), tracklets=_tmp_tracklets))
-        except Exception:
-            pass
-        redact_by_id[at.internal_id] = redact
-        score_by_id[at.internal_id] = score
-        snapshot_path_by_id[at.internal_id] = snap_path
-        isolated_by_id[at.internal_id] = isolated_ids
-        best_frame_by_id[at.internal_id] = at.best_frame
 
-        # Schedule unblock (hold for bridging window) instead of immediate.
+        # Schedule unblock (hold for bridging window).
         if max_gap > 0:
             unblock_frame = at.last_frame + max_gap + 1
             unblock_at.setdefault(unblock_frame, set()).add(at.internal_id)
         else:
-            # unblock now
             for idx in list(frame_blockers.keys()):
                 if at.internal_id in frame_blockers[idx]:
                     frame_blockers[idx].discard(at.internal_id)
             for gs in list(gop_blockers.keys()):
                 gop_blockers[gs].discard(at.internal_id)
 
-    # bookend pass: track first and last chunks quickly to classify boundary tracklets early.
-    # We implement by simply running the main loop over the whole video; bookends toggle
-    # only affects nothing here (classification happens at close). For simplicity, bookends
-    # flag is accepted but main loop already classifies at close. (No-op kept for compat.)
+        # Push to classification queue (async).
+        classify_queue.put(at)
+
+    def _finalize_classified():
+        """Process any newly classified tracklets: render boxes, bridging, meta write."""
+        newly = []
+        with _state_lock:
+            for tid in list(classified_ids):
+                if tid in _finalized_ids:
+                    continue
+                if tid not in pending_results:
+                    continue
+                newly.append(tid)
+        for tid in newly:
+            with _state_lock:
+                redact, score, snap_path, isolated_ids = pending_results[tid]
+                at = tracklet_by_id[tid]
+            # compute render boxes if redacted
+            if redact is True:
+                filled_frames, filled_boxes = _fill_tracklet_gaps(at.frames, at.boxes, max_gap)
+                if smooth_window > 1 and len(filled_boxes) > 1:
+                    filled_boxes = _smooth_boxes(filled_frames, filled_boxes, smooth_window)
+                for f, box in zip(filled_frames, filled_boxes):
+                    pb = _clamp_box(box, w, h)
+                    if pb is not None:
+                        render_boxes.setdefault(f, []).append(pb)
+                # bridging
+                if bridge_iou > 0 and max_gap > 0:
+                    with _state_lock:
+                        for prev in closed_redacted:
+                            gap = at.first_frame - prev.last_frame - 1
+                            if not (0 < gap <= max_gap):
+                                continue
+                            if _box_iou(prev.boxes[-1], at.boxes[0]) < bridge_iou:
+                                continue
+                            for step in range(1, gap + 1):
+                                t = step / (gap + 1)
+                                box = _lerp_box(prev.boxes[-1], at.boxes[0], t)
+                                frame_idx = prev.last_frame + step
+                                pb = _clamp_box(box, w, h)
+                                if pb is not None:
+                                    render_boxes.setdefault(frame_idx, []).append(pb)
+                        closed_redacted.append(at)
+            # store results
+            redact_by_id[tid] = redact
+            score_by_id[tid] = score
+            snapshot_path_by_id[tid] = snap_path
+            isolated_by_id[tid] = isolated_ids
+            best_frame_by_id[tid] = at.best_frame
+            # periodic meta write
+            try:
+                _tmp_tracklets = []
+                with _state_lock:
+                    _closed = list(closed_tracklets)
+                for _at in sorted(_closed, key=lambda a: a.internal_id):
+                    _tmp_tracklets.append(Tracklet(
+                        track_id=_at.internal_id,
+                        frames=list(_at.frames),
+                        boxes=[list(b) for b in _at.boxes],
+                        keypoints=[list(k) for k in _at.keypoints],
+                        best_frame=best_frame_by_id.get(_at.internal_id),
+                        best_snapshot_path=snapshot_path_by_id.get(_at.internal_id),
+                        isolated_track_ids=list(isolated_by_id.get(_at.internal_id, [])),
+                        redact=redact_by_id.get(_at.internal_id),
+                        score=score_by_id.get(_at.internal_id),
+                    ))
+                save_meta(meta_file, Metadata(video=VideoInfo(path=str(video), fps=fps, width=w, height=h, frames=info.frame_count), tracklets=_tmp_tracklets))
+            except Exception:
+                pass
+            with _state_lock:
+                _finalized_ids.add(tid)
+
     # Main pass
     def save_checkpoint(last_frame):
         try:
@@ -638,7 +713,7 @@ def run_pipeline_streaming(
             dist = float(__import__("cv2").compareHist(prev_hist, hist, __import__("cv2").HISTCMP_BHATTACHARYYA))
             if dist >= scene_cut_threshold:
                 for tid in list(active.keys()):
-                    close_and_classify(active.pop(tid))
+                    close_tracklet(active.pop(tid))
         prev_hist = hist
 
         # tracking on sampled frames
@@ -719,7 +794,7 @@ def run_pipeline_streaming(
             else:
                 # dropout close
                 if frame_idx - at.last_frame > close_threshold:
-                    close_and_classify(active.pop(tid))
+                    close_tracklet(active.pop(tid))
 
         def _gop_start_of(fidx):
             for gs, ge in gops:
@@ -729,12 +804,24 @@ def run_pipeline_streaming(
 
         # process scheduled unblocks (bridging hold)
         if frame_idx in unblock_at:
-            for tid in unblock_at.pop(frame_idx):
-                for idx in list(frame_blockers.keys()):
-                    if tid in frame_blockers[idx]:
-                        frame_blockers[idx].discard(tid)
-                for gs in list(gop_blockers.keys()):
-                    gop_blockers[gs].discard(tid)
+            for tid in list(unblock_at.pop(frame_idx)):
+                with _state_lock:
+                    is_classified = tid in classified_ids
+                if is_classified:
+                    for idx in list(frame_blockers.keys()):
+                        if tid in frame_blockers[idx]:
+                            frame_blockers[idx].discard(tid)
+                    for gs in list(gop_blockers.keys()):
+                        gop_blockers[gs].discard(tid)
+                else:
+                    # reschedule
+                    unblock_at.setdefault(frame_idx + 1, set()).add(tid)
+
+        # Process newly classified tracklets (render boxes, bridging, meta).
+        try:
+            _finalize_classified()
+        except Exception:
+            pass
 
         if selective_stream:
             gs = _gop_start_of(frame_idx)
@@ -820,7 +907,7 @@ def run_pipeline_streaming(
 
     # end: close all remaining active
     for tid in list(active.keys()):
-        close_and_classify(active.pop(tid))
+        close_tracklet(active.pop(tid))
 
     if (not defer_render) and (not selective_stream):
         # ship remaining buffered frames
@@ -848,6 +935,17 @@ def run_pipeline_streaming(
             pass
         if proc is not None:
             proc.wait()
+
+    # Drain classification queue.
+    classify_queue.put(None)
+    try:
+        _worker_thread.join(timeout=300)
+    except Exception:
+        pass
+    try:
+        _finalize_classified()
+    except Exception:
+        pass
 
     # release any remaining scheduled unblocks
     for tids in unblock_at.values():
