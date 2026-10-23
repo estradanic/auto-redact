@@ -720,7 +720,10 @@ def run_pipeline_streaming(
         if frame_idx % sample_rate == 0:
             # Use model.track returns list; _extract fills obs dict
             obs: dict[int, list] = {}
-            for result in yolo.track(frame_rgb, **track_kwargs):
+            with _gpu_lock:
+                _track_results = list(yolo.track(frame_rgb, **track_kwargs))
+                _manage_vram("track")
+            for result in _track_results:
                 _extract(result, frame_idx, obs)
             # obs: tid -> [(frame_idx, box, kps)]
             for tid, frames_obs in obs.items():
