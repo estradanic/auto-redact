@@ -728,6 +728,10 @@ def run_pipeline_streaming(
              "-movflags", "+faststart", str(out)],
             check=True,
         )
+        try:
+            growing_ts.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     # build metadata
     tracklets = []
