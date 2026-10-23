@@ -293,7 +293,7 @@ def run_pipeline_streaming(
     if has_audio:
         cmd += ["-map", "1:a:0", "-c:a", "copy"]
     cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset,
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out)]
+            "-pix_fmt", "yuv420p", "-movflags", "frag_keyframe+empty_moov", str(out)]
     proc = None
     if not defer_render and not selective_stream:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -419,6 +419,24 @@ def run_pipeline_streaming(
             closed_redacted.append(at)
 
         closed_tracklets.append(at)
+        # Periodic meta write so progress is inspectable mid-run.
+        try:
+            _tmp_tracklets = []
+            for _at in sorted(closed_tracklets, key=lambda a: a.internal_id):
+                _tmp_tracklets.append(Tracklet(
+                    track_id=_at.internal_id,
+                    frames=list(_at.frames),
+                    boxes=[list(b) for b in _at.boxes],
+                    keypoints=[list(k) for k in _at.keypoints],
+                    best_frame=best_frame_by_id.get(_at.internal_id),
+                    best_snapshot_path=snapshot_path_by_id.get(_at.internal_id),
+                    isolated_track_ids=list(isolated_by_id.get(_at.internal_id, [])),
+                    redact=redact_by_id.get(_at.internal_id),
+                    score=score_by_id.get(_at.internal_id),
+                ))
+            save_meta(meta_file, Metadata(video=VideoInfo(path=str(video), fps=fps, width=w, height=h, frames=info.frame_count), tracklets=_tmp_tracklets))
+        except Exception:
+            pass
         redact_by_id[at.internal_id] = redact
         score_by_id[at.internal_id] = score
         snapshot_path_by_id[at.internal_id] = snap_path
