@@ -155,7 +155,7 @@ def run_pipeline_streaming(
     max_image_size=DEFAULT_MAX_IMAGE_SIZE,
     crf=18,
     preset="medium",
-    selective=False,  # selective+streaming not supported on this branch
+    selective=True,  # accepted; streaming uses GOP append
     encoder="libx264",
     max_gap=DEFAULT_MAX_GAP,
     smooth_window=DEFAULT_SMOOTH_WINDOW,
@@ -170,8 +170,6 @@ def run_pipeline_streaming(
 ) -> dict:
     if classifier not in ("vlm", "siglip"):
         raise ValueError(f"unknown classifier {classifier!r}")
-    if selective:
-        raise ValueError("selective=True is not supported with streaming on this branch; use selective=False")
     if model is None:
         model = DEFAULT_SIGLIP_MODEL if classifier == "siglip" else DEFAULT_MODEL
 
@@ -264,6 +262,7 @@ def run_pipeline_streaming(
     # frame buffer: idx -> ndarray or Path (spilled)
     frame_buffer: dict[int, Any] = {}
     spill_dir = Path(tempfile.mkdtemp(prefix="auto-redact-stream-"))
+    growing_ts = out.with_suffix(".ts")
     in_memory_count = [0]
 
     frame_blockers: dict[int, set[int]] = {}
@@ -605,11 +604,18 @@ def run_pipeline_streaming(
                 seg = _Segment(gstart, gend, edited)
                 seg_path = Path(tempfile.mkdtemp(prefix="auto-redact-gop-")) / f"gop_{gstart:06d}.mp4"
                 # reuse a single temp dir? use spill_dir
-                seg_path = spill_dir / f"gop_{gstart:06d}.mp4"
+                seg_path = spill_dir / f"gop_{gstart:06d}.ts"
                 if edited:
                     _encode_segment(video, seg_path, render_boxes, keyframes, seg, info, crf, preset, encoder)
                 else:
                     _copy_segment(video, seg_path, keyframes, seg)
+                # Append this GOP to the growing TS file for mid-run playability.
+                with open(growing_ts, "ab") as _f:
+                    _f.write(seg_path.read_bytes())
+                try:
+                    seg_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
                 segments.append(seg_path)
                 shipped_gops.add(gstart)
         elif not defer_render:
@@ -700,16 +706,28 @@ def run_pipeline_streaming(
             frames = gop_frames.pop(gstart, [])
             edited = any(idx in render_boxes for idx, _ in frames)
             seg = _Segment(gstart, gend, edited)
-            seg_path = spill_dir / f"gop_{gstart:06d}.mp4"
+            seg_path = spill_dir / f"gop_{gstart:06d}.ts"
             if edited:
                 _encode_segment(video, seg_path, render_boxes, keyframes, seg, info, crf, preset, encoder)
             else:
                 _copy_segment(video, seg_path, keyframes, seg)
+            # Append this GOP to the growing TS file for mid-run playability.
+            with open(growing_ts, "ab") as _f:
+                _f.write(seg_path.read_bytes())
+            try:
+                seg_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             segments.append(seg_path)
             shipped_gops.add(gstart)
-        joined = spill_dir / "joined.mp4"
-        _concat_video(segments, joined)
-        _mux_audio(joined, video, out)
+        # Remux the growing TS into the final MP4 (faststart for playability).
+        import subprocess as _sp
+        _sp.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", str(growing_ts), "-i", str(video),
+             "-map", "0:v:0", "-map", "1:a?", "-c", "copy",
+             "-movflags", "+faststart", str(out)],
+            check=True,
+        )
 
     # build metadata
     tracklets = []

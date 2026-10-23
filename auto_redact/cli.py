@@ -793,9 +793,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
     setup_logging()
     out = _resolve_out(args.out, args.video)
     if getattr(args, "streaming", False):
-        if getattr(args, "selective", False):
-            print("auto-redact: error: --streaming and --selective cannot be used together on this branch; use --no-selective", file=sys.stderr)
-            return 1
         result = run_pipeline_streaming(
             args.video,
             args.prompt,
