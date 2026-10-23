@@ -153,6 +153,7 @@ def run_pipeline_streaming(
     classify_workers=DEFAULT_WORKERS,
     think=False,
     max_image_size=DEFAULT_MAX_IMAGE_SIZE,
+    keep_alive="24h",
     crf=18,
     preset="medium",
     selective=True,  # accepted; streaming uses GOP append
@@ -289,7 +290,7 @@ def run_pipeline_streaming(
         progress("      waiting for ollama to load the model")
 
     def make_vlm():
-        return VlmClassifier(model, ollama_url, timeout, think, "10m", max_image_size)
+        return VlmClassifier(model, ollama_url, timeout, think, keep_alive, max_image_size)
 
     yolo = _load_yolo(device if device != "auto" else None)
     # ensure on device
