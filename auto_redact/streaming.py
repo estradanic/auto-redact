@@ -205,6 +205,7 @@ def run_pipeline_streaming(
                 total = _torch.cuda.get_device_properties(0).total_memory / (1024**3)
                 if alloc > 0.85 * total:
                     progress(f"      VRAM high ({tag}): {alloc:.1f}/{total:.1f} GB")
+                    _torch.cuda.empty_cache()
                 _torch.cuda.synchronize()
             except Exception:
                 pass
