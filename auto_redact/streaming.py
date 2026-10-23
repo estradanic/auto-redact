@@ -155,7 +155,7 @@ def run_pipeline_streaming(
     max_image_size=DEFAULT_MAX_IMAGE_SIZE,
     crf=18,
     preset="medium",
-    selective=True,  # accepted; streaming uses full re-encode
+    selective=False,  # selective+streaming not supported on this branch
     encoder="libx264",
     max_gap=DEFAULT_MAX_GAP,
     smooth_window=DEFAULT_SMOOTH_WINDOW,
@@ -170,6 +170,8 @@ def run_pipeline_streaming(
 ) -> dict:
     if classifier not in ("vlm", "siglip"):
         raise ValueError(f"unknown classifier {classifier!r}")
+    if selective:
+        raise ValueError("selective=True is not supported with streaming on this branch; use selective=False")
     if model is None:
         model = DEFAULT_SIGLIP_MODEL if classifier == "siglip" else DEFAULT_MODEL
 
