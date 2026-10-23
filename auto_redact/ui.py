@@ -13,7 +13,7 @@ ProgressCallback = Callable[[int, int], None]
 
 
 @contextlib.contextmanager
-def progress_bar(desc: str, unit: str | None = None) -> Iterator[ProgressCallback]:
+def progress_bar(desc: str, unit: str | None = None, position: int = 0) -> Iterator[ProgressCallback]:
     """Yield an ``on_progress(done, total)`` callback driving one bar.
 
     The bar is hidden automatically when stderr isn't a terminal.
@@ -24,6 +24,8 @@ def progress_bar(desc: str, unit: str | None = None) -> Iterator[ProgressCallbac
         file=sys.stderr,
         disable=None,
         dynamic_ncols=True,
+        position=position,
+        leave=True,
         bar_format="{desc:<10} {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
         "[{elapsed}<{remaining}, {rate_fmt}]",
     )

@@ -682,19 +682,55 @@ def run_pipeline_streaming(
     # track sampled frames separately; but iter_frames sample_rate=1 yields all.
     last_seen_global = 0
 
-    _stream_bar_ctx = None
-    _stream_on_progress = None
+    # Multiple concurrent bars: track, classify, ship.
+    _track_bar_ctx = None
+    _track_on_progress = None
+    _classify_bar_ctx = None
+    _classify_on_progress = None
+    _ship_bar_ctx = None
+    _ship_on_progress = None
+
+    def _open_bar(desc, position):
+        nonlocal _track_bar_ctx, _track_on_progress
+        # Try position-aware; fall back for test fakes.
+        try:
+            ctx = bar(desc, position=position)
+        except TypeError:
+            ctx = bar(desc)
+        cb = ctx.__enter__()
+        return ctx, cb
+
     try:
-        _stream_bar_ctx = bar("stream")
-        _stream_on_progress = _stream_bar_ctx.__enter__()
+        _track_bar_ctx, _track_on_progress = _open_bar("track", 0)
     except Exception:
-        _stream_bar_ctx = None
-        _stream_on_progress = None
+        _track_bar_ctx = None
+        _track_on_progress = None
+    try:
+        _classify_bar_ctx, _classify_on_progress = _open_bar("classify", 1)
+    except Exception:
+        _classify_bar_ctx = None
+        _classify_on_progress = None
+    try:
+        _ship_bar_ctx, _ship_on_progress = _open_bar("ship", 2)
+    except Exception:
+        _ship_bar_ctx = None
+        _ship_on_progress = None
 
     for frame_idx, frame_rgb in frame_iter:
-        if _stream_on_progress is not None:
+        if _track_on_progress is not None:
             try:
-                _stream_on_progress(frame_idx + 1, total)
+                _track_on_progress(frame_idx + 1, total)
+            except Exception:
+                pass
+        if _classify_on_progress is not None:
+            try:
+                # classified count = number of finalized tracklets
+                _classify_on_progress(len(_finalized_ids), max(1, len(closed_tracklets) + 1))
+            except Exception:
+                pass
+        if _ship_on_progress is not None:
+            try:
+                _ship_on_progress(next_ship[0] if not selective_stream else len(shipped_gops), total)
             except Exception:
                 pass
         # checkpoint previous frame's state
@@ -704,8 +740,6 @@ def run_pipeline_streaming(
             except Exception:
                 pass
         # progress
-        if frame_idx % 50 == 0:
-            progress(f"      frame {frame_idx}/{total}")
 
         # scene cut
         bgr = _bgr(frame_rgb)
@@ -903,11 +937,12 @@ def run_pipeline_streaming(
                 in_memory_count[0] = max(0, in_memory_count[0] - (0 if isinstance(v, Path) else 1))
                 next_ship[0] += 1
 
-    if _stream_bar_ctx is not None:
-        try:
-            _stream_bar_ctx.__exit__(None, None, None)
-        except Exception:
-            pass
+    for _ctx in (_track_bar_ctx, _classify_bar_ctx, _ship_bar_ctx):
+        if _ctx is not None:
+            try:
+                _ctx.__exit__(None, None, None)
+            except Exception:
+                pass
 
     # end: close all remaining active
     for tid in list(active.keys()):
