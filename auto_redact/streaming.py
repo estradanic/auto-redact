@@ -605,7 +605,21 @@ def run_pipeline_streaming(
     # track sampled frames separately; but iter_frames sample_rate=1 yields all.
     last_seen_global = 0
 
+    _stream_bar_ctx = None
+    _stream_on_progress = None
+    try:
+        _stream_bar_ctx = bar("stream")
+        _stream_on_progress = _stream_bar_ctx.__enter__()
+    except Exception:
+        _stream_bar_ctx = None
+        _stream_on_progress = None
+
     for frame_idx, frame_rgb in frame_iter:
+        if _stream_on_progress is not None:
+            try:
+                _stream_on_progress(frame_idx + 1, total)
+            except Exception:
+                pass
         # checkpoint previous frame's state
         if frame_idx > start_frame and (frame_idx - 1) % 50 == 0:
             try:
@@ -796,6 +810,12 @@ def run_pipeline_streaming(
                         pass
                 in_memory_count[0] = max(0, in_memory_count[0] - (0 if isinstance(v, Path) else 1))
                 next_ship[0] += 1
+
+    if _stream_bar_ctx is not None:
+        try:
+            _stream_bar_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
 
     # end: close all remaining active
     for tid in list(active.keys()):
