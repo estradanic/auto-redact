@@ -42,7 +42,7 @@ def test_streaming_matches_classic_metadata(clip, tmp_path):
     run_pipeline(
         clip, "person in a suit", classic_dir / "out.mp4",
         thumbs_dir=classic_dir / "thumbs", ollama_url="http://localhost:11434",
-        classify_workers=1, track_workers=1, scene_cuts=True,
+        classify_workers=1, scene_cuts=True,
         progress=lambda m: None,
     )
     run_pipeline_streaming(
@@ -70,7 +70,7 @@ def test_streaming_frame_count_matches(clip, tmp_path):
     run_pipeline(
         clip, "person in a suit", classic_dir / "out.mp4",
         thumbs_dir=classic_dir / "thumbs", ollama_url="http://localhost:11434",
-        classify_workers=1, track_workers=1, scene_cuts=True,
+        classify_workers=1, scene_cuts=True,
         progress=lambda m: None,
     )
     run_pipeline_streaming(

@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,7 +31,6 @@ import os
 import json
 import shutil
 import tempfile
-from concurrent.futures import as_completed
 from .frames import iter_frames, probe_video
 from .meta import Metadata, Tracklet, VideoInfo, load_meta, save_meta, MetaError
 
@@ -99,9 +97,6 @@ _get_yolo_model = _load_yolo
 # (frame index, bbox, keypoints) per observation, keyed by tracker id.
 Observations = dict[int, list[tuple[int, list[float], list[list[float]]]]]
 
-OVERLAP_SECONDS = 1.0
-MATCH_IOU = 0.5
-MIN_CHUNK_FRAMES_PER_OVERLAP = 4
 
 
 def _iou(a: list[float], b: list[float]) -> float:
@@ -112,81 +107,6 @@ def _iou(a: list[float], b: list[float]) -> float:
     inter = iw * ih
     union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
     return inter / union if union > 0 else 0.0
-
-
-def _match_tracks(
-    left: Observations, right: Observations, lo: int, hi: int
-) -> dict[int, int]:
-    """Match ``right`` ids to ``left`` ids by mean IoU over frames in [lo, hi)."""
-    boxes_l = {
-        tid: {f: box for f, box, _ in obs if lo <= f < hi} for tid, obs in left.items()
-    }
-    boxes_r = {
-        tid: {f: box for f, box, _ in obs if lo <= f < hi} for tid, obs in right.items()
-    }
-    pairs: list[tuple[float, int, int]] = []
-    for tl, bl in boxes_l.items():
-        for tr, br in boxes_r.items():
-            shared = bl.keys() & br.keys()
-            if not shared:
-                continue
-            score = sum(_iou(bl[f], br[f]) for f in shared) / len(shared)
-            if score >= MATCH_IOU:
-                pairs.append((score, tl, tr))
-    pairs.sort(reverse=True)
-    matched: dict[int, int] = {}
-    used_left: set[int] = set()
-    for _, tl, tr in pairs:
-        if tl in used_left or tr in matched:
-            continue
-        used_left.add(tl)
-        matched[tr] = tl
-    return matched
-
-
-def merge_chunks(
-    chunks: list[Observations], bounds: list[int], overlap: int
-) -> Observations:
-    """Stitch per-chunk observations into one set with globally unique ids.
-
-    ``chunks[i]`` was tracked over ``[bounds[i] - overlap, bounds[i + 1] +
-    overlap)`` and owns the frames in ``[bounds[i], bounds[i + 1])``. At each
-    boundary, tracklets are matched across the two neighbouring chunks by mean
-    IoU over the shared window; a match keeps the earlier chunk's id. Each
-    chunk then contributes only the frames it owns. Returned ids are
-    renumbered from 1 in order of first appearance.
-    """
-    n = len(chunks)
-    owned_lo = [bounds[i] if i > 0 else 0 for i in range(n)]
-    owned_hi = [bounds[i + 1] if i < n - 1 else None for i in range(n)]
-    next_id = 1
-    merged: Observations = {}
-    prev_global: dict[int, int] = {}
-    for i, chunk in enumerate(chunks):
-        matches = (
-            _match_tracks(chunks[i - 1], chunk, bounds[i] - overlap, bounds[i] + overlap)
-            if i > 0
-            else {}
-        )
-        global_ids: dict[int, int] = {}
-        for tid in sorted(chunk):
-            if tid in matches:
-                global_ids[tid] = prev_global[matches[tid]]
-            else:
-                global_ids[tid] = next_id
-                next_id += 1
-        hi = owned_hi[i]
-        for tid, obs in chunk.items():
-            kept = [
-                o for o in obs if o[0] >= owned_lo[i] and (hi is None or o[0] < hi)
-            ]
-            if kept:
-                merged.setdefault(global_ids[tid], []).extend(kept)
-        prev_global = global_ids
-    for obs in merged.values():
-        obs.sort(key=lambda o: o[0])
-    order = sorted(merged, key=lambda g: (merged[g][0][0], g))
-    return {new: merged[old] for new, old in enumerate(order, start=1)}
 
 
 def _extract(result: Any, frame_idx: int, observations: Observations) -> None:
@@ -239,7 +159,6 @@ def _track_range(
     iou: float = 0.7,
     imgsz: int | None = None,
     tracker: str = "bytetrack.yaml",
-    workers: int = 1,
 ) -> Observations:
     model = YOLO("yolo11n-pose.pt")
     model.to(device)
@@ -252,32 +171,12 @@ def _track_range(
         track_kwargs["imgsz"] = imgsz
     for frame_idx, frame in iter_frames(
         video_path, sample_rate=sample_rate, start=start, stop=stop,
-        threads=max(1, (os.cpu_count() or 1) // workers),
+        threads=os.cpu_count(),
     ):
         on_frame()
         for result in model.track(frame, **track_kwargs):
             _extract(result, frame_idx, observations)
     return observations
-
-
-def _plan_chunks(
-    frame_count: int, workers: int, sample_rate: int, fps: float
-) -> tuple[list[int], int]:
-    """Return chunk boundaries (``len == chunks + 1``) and the overlap in frames.
-
-    Boundaries and overlap are multiples of ``sample_rate`` so every chunk
-    samples the same frames a single pass would. Too-short videos get fewer
-    chunks (down to one).
-    """
-    overlap = max(1, round(fps * OVERLAP_SECONDS / sample_rate)) * sample_rate
-    workers = max(1, min(workers, frame_count // (overlap * MIN_CHUNK_FRAMES_PER_OVERLAP)))
-    bounds = [0]
-    for i in range(1, workers):
-        bounds.append(round(frame_count * i / workers / sample_rate) * sample_rate)
-    bounds.append(frame_count)
-    return bounds, overlap
-
-
 
 
 def _resolve_meta_path(
@@ -313,64 +212,6 @@ def _resolve_meta_path(
     return None
 
 
-def _cache_dir_for(meta_path: Path | None) -> Path | None:
-    if meta_path is None:
-        return None
-    return meta_path.with_name(meta_path.stem + "_track_chunks")
-
-
-def _serialize_obs(obs: Observations) -> dict:
-    out: dict = {}
-    for tid, frames in obs.items():
-        serialized = []
-        for frame_idx, box, kps in frames:
-            serialized.append(
-                [
-                    int(frame_idx),
-                    [float(v) for v in box],
-                    [
-                        [float(v) for v in kp] if isinstance(kp, (list, tuple)) else [0.0, 0.0, 0.0]
-                        for kp in kps
-                    ],
-                ]
-            )
-        out[str(int(tid))] = serialized
-    return out
-
-
-def _deserialize_obs(data: Any) -> Observations:
-    obs: Observations = {}
-    for tid, frames in (data or {}).items():
-        deserialized = []
-        for item in frames:
-            frame_idx = int(item[0])
-            box = [float(v) for v in item[1]]
-            kps = []
-            for kp in item[2]:
-                if isinstance(kp, (list, tuple)) and len(kp) >= 3:
-                    kps.append([float(kp[0]), float(kp[1]), float(kp[2])])
-                else:
-                    kps.append([0.0, 0.0, 0.0])
-            deserialized.append((frame_idx, box, kps))
-        obs[int(tid)] = deserialized
-    return obs
-
-
-def _save_chunk(cache_dir: Path, index: int, obs: Observations) -> None:
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    (cache_dir / f"chunk_{index}.json").write_text(
-        json.dumps(_serialize_obs(obs)) + "\n", encoding="utf-8"
-    )
-
-
-def _load_chunk(path: Path) -> Observations | None:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return _deserialize_obs(data)
-
-
 def _same_video(meta: Metadata, video_path: Path, info: Any) -> bool:
     try:
         return (
@@ -386,7 +227,6 @@ def build_tracklets(
     sample_rate: int = 1,
     device: str | None = "auto",
     on_progress: Callable[[int, int], None] | None = None,
-    workers: int = 1,
     half: bool = True,
     conf: float = 0.25,
     iou: float = 0.7,
@@ -443,9 +283,6 @@ def build_tracklets(
         raise ValueError(f"sample_rate must be an integer, got {sample_rate!r}")
     if sample_rate < 1:
         raise ValueError(f"sample_rate must be >= 1, got {sample_rate}")
-    if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
-        raise ValueError(f"workers must be an integer >= 1, got {workers!r}")
-
     video_path = Path(video_path)
     if not video_path.is_file():
         raise FileNotFoundError(f"no such video file: {video_path}")
@@ -454,152 +291,32 @@ def build_tracklets(
     device = _select_device(device)
     half = half and device.startswith("cuda")
 
-    bounds, overlap = _plan_chunks(info.frame_count, workers, sample_rate, info.fps)
-    n = len(bounds) - 1
-    ranges = [
-        (
-            max(0, bounds[i] - overlap) if i > 0 else 0,
-            bounds[i + 1] + overlap if i < n - 1 else None,
-        )
-        for i in range(n)
-    ]
+    # Single-pass tracking (no chunking) for deterministic, parity-preserving results.
+    on_frame_cb = on_progress if on_progress is not None else (lambda: None)
 
-    cache_dir = _cache_dir_for(target) if resume else None
+    def _on_frame_wrapper():
+        # _track_range calls on_frame() per frame; adapt to on_progress(done,total)
+        # We'll just call on_progress with incrementing counter.
+        pass
 
-    # Force: drop any cached progress.
-    if force:
-        if target is not None and target.is_file():
-            try:
-                target.unlink()
-            except OSError:
-                pass
-        if cache_dir is not None and cache_dir.is_dir():
-            shutil.rmtree(cache_dir, ignore_errors=True)
+    # Simpler: call _track_range with a no-op on_frame, then report progress at end.
+    obs_container = {"done": 0}
 
-    # Resume from a complete metadata file.
-    if resume and not force and target is not None and target.is_file():
-        try:
-            loaded = load_meta(target)
-        except MetaError:
-            loaded = None
-        if loaded is not None and _same_video(loaded, video_path, info):
-            return loaded
+    def on_frame():
+        obs_container["done"] += 1
+        if on_progress is not None:
+            on_progress(obs_container["done"], max(info.frame_count, obs_container["done"]))
 
-    # Validate / reset chunk cache against current plan.
-    if cache_dir is not None and cache_dir.is_dir():
-        manifest_path = cache_dir / "manifest.json"
-        expected_manifest = {
-            "video": str(video_path.resolve()),
-            "sample_rate": sample_rate,
-            "workers": workers,
-            "device": device,
-            "half": bool(half),
-            "conf": conf,
-            "iou": iou,
-            "imgsz": imgsz,
-            "tracker": tracker,
-            "bounds": bounds,
-            "overlap": overlap,
-        }
-        manifest = None
-        if manifest_path.is_file():
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                manifest = None
-        if manifest != expected_manifest:
-            shutil.rmtree(cache_dir, ignore_errors=True)
-
-    total_all = sum(
-        -(-((stop if stop is not None else info.frame_count) - start) // sample_rate)
-        for start, stop in ranges
+    observations = _track_range(
+        video_path, device, sample_rate, 0, None, on_frame,
+        half, conf, iou, imgsz, tracker,
     )
 
-    chunks: list[Observations | None] = [None] * n
+    if on_progress is not None:
+        on_progress(info.frame_count, info.frame_count)
 
-    # Load any cached chunks.
-    if cache_dir is not None and cache_dir.is_dir():
-        for i in range(n):
-            cp = cache_dir / f"chunk_{i}.json"
-            if cp.is_file():
-                loaded_chunk = _load_chunk(cp)
-                if loaded_chunk is not None:
-                    chunks[i] = loaded_chunk
+    merged = observations
 
-    missing = [i for i in range(n) if chunks[i] is None]
-
-    if missing:
-        lock = threading.Lock()
-        done = 0
-        total_missing = sum(
-            -(-((ranges[i][1] if ranges[i][1] is not None else info.frame_count) - ranges[i][0]) // sample_rate)
-            for i in missing
-        )
-
-        def on_frame() -> None:
-            nonlocal done
-            with lock:
-                done += 1
-                if on_progress is not None:
-                    on_progress(done, max(total_missing, done))
-
-        with ThreadPoolExecutor(max_workers=len(missing)) as pool:
-            futures = {}
-            for i in missing:
-                start, stop = ranges[i]
-                fut = pool.submit(
-                    _track_range,
-                    video_path,
-                    device,
-                    sample_rate,
-                    start,
-                    stop,
-                    on_frame,
-                    half,
-                    conf,
-                    iou,
-                    imgsz,
-                    tracker,
-                    workers,
-                )
-                futures[fut] = i
-            for fut in as_completed(futures):
-                i = futures[fut]
-                obs = fut.result()
-                chunks[i] = obs
-                if cache_dir is not None:
-                    cache_dir.mkdir(parents=True, exist_ok=True)
-                    _save_chunk(cache_dir, i, obs)
-                    manifest_path = cache_dir / "manifest.json"
-                    if not manifest_path.is_file():
-                        manifest_path.write_text(
-                            json.dumps(
-                                {
-                                    "video": str(video_path.resolve()),
-                                    "sample_rate": sample_rate,
-                                    "workers": workers,
-                                    "device": device,
-                                    "half": bool(half),
-                                    "conf": conf,
-                                    "iou": iou,
-                                    "imgsz": imgsz,
-                                    "tracker": tracker,
-                                    "bounds": bounds,
-                                    "overlap": overlap,
-                                }
-                            )
-                            + "\n",
-                            encoding="utf-8",
-                        )
-
-    if not missing and on_progress is not None and total_all > 0:
-        on_progress(total_all, total_all)
-
-    safe_chunks = [c if c is not None else {} for c in chunks]
-    if n == 1:
-        merged = safe_chunks[0]
-    else:
-        merged = merge_chunks(safe_chunks, bounds, overlap)
 
     tracklets = [
         Tracklet(

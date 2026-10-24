@@ -130,7 +130,6 @@ def run_pipeline_streaming(
     force=False,
     sample_rate=1,
     device="auto",
-    track_workers=1,  # accepted for compat; streaming tracks in one pass
     half=True,
     track_conf=0.25,
     track_iou=0.7,

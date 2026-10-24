@@ -190,17 +190,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable FP16 tracking inference (on by default on CUDA)",
     )
     track.add_argument(
-        "--track-workers",
-        type=int,
-        default=2,
-        metavar="N",
-        help=(
-            "Track N chunks of the video concurrently (default: 2). Useful "
-            "when the GPU is underused; tracklets crossing chunk seams are "
-            "stitched by box overlap"
-        ),
-    )
-    track.add_argument(
         "--no-resume",
         action="store_true",
         help=(
@@ -532,17 +521,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable FP16 tracking inference (on by default on CUDA)",
     )
     run.add_argument(
-        "--track-workers",
-        type=int,
-        default=2,
-        metavar="N",
-        help=(
-            "Track N chunks of the video concurrently (default: 2). Useful "
-            "when the GPU is underused; tracklets crossing chunk seams are "
-            "stitched by box overlap"
-        ),
-    )
-    run.add_argument(
         "--no-resume",
         action="store_true",
         help=(
@@ -808,7 +786,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
             force=args.force,
             sample_rate=args.sample_rate,
             device=args.device,
-            track_workers=args.track_workers,
             half=not args.no_half,
             resume=not args.no_resume,
             padding=args.padding,
@@ -859,7 +836,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
         force=args.force,
         sample_rate=args.sample_rate,
         device=args.device,
-        track_workers=args.track_workers,
         half=not args.no_half,
         resume=not args.no_resume,
         padding=args.padding,
@@ -910,7 +886,6 @@ def _cmd_track(args: argparse.Namespace) -> int:
             sample_rate=args.sample_rate,
             device=args.device,
             on_progress=on_progress,
-            workers=args.track_workers,
             half=not args.no_half,
             conf=args.track_conf,
             iou=args.track_iou,
