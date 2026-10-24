@@ -158,7 +158,7 @@ def run_pipeline_streaming(
     classify_workers=DEFAULT_WORKERS,
     think=False,
     max_image_size=DEFAULT_MAX_IMAGE_SIZE,
-    keep_alive="24h",
+    keep_alive="3h",
     crf=18,
     preset="medium",
     selective=True,  # accepted; streaming uses GOP append

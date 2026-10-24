@@ -700,9 +700,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--keep-alive",
-        default="24h",
+        default="3h",
         metavar="DUR",
-        help="vlm only: how long ollama keeps the model loaded between classifications (default: 24h)",
+        help="vlm only: how long ollama keeps the model loaded between classifications (default: 3h)",
     )
     run.add_argument(
         "--crf",
