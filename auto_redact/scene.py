@@ -57,7 +57,6 @@ def detect_scene_cuts(
 
     cuts: list[int] = []
     prev_hist: np.ndarray | None = None
-    prev_index: int | None = None
     total = 0
 
     try:
@@ -66,22 +65,17 @@ def detect_scene_cuts(
             # Best-effort total for progress; some containers omit it.
             if stream.frames and stream.frames > 0:
                 total = int(stream.frames)
-            time_base = stream.time_base
-            rate = stream.average_rate
             index = 0
             for frame in container.decode(video=0):
-                if rate is not None and time_base is not None and frame.pts is not None:
-                    index = round(float(frame.pts * time_base * rate))
                 image = frame.to_ndarray(format="bgr24")
                 hist = _frame_hist(image)
-                if prev_hist is not None and prev_index is not None:
+                if prev_hist is not None:
                     distance = float(
                         cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA)
                     )
                     if distance >= threshold:
                         cuts.append(index)
                 prev_hist = hist
-                prev_index = index
                 if on_progress is not None:
                     done = index + 1
                     on_progress(done, total if total > 0 else max(done, 1))
