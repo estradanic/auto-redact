@@ -8,7 +8,9 @@ One subcommand per pipeline stage (see README): ``track`` (issues #9/#10),
 from __future__ import annotations
 
 import argparse
+import shutil
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -198,6 +200,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    track.add_argument(
+        "--no-inhibit",
+        action="store_true",
+        default=False,
+        help="Do not prevent the system from sleeping during processing",
+    )
     _add_scene_args(track)
     snapshot = commands.add_parser(
         "snapshot",
@@ -323,6 +331,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip writing the contact sheet",
     )
 
+    snapshot.add_argument(
+        "--no-inhibit",
+        action="store_true",
+        default=False,
+        help="Do not prevent the system from sleeping during processing",
+    )
     classify = commands.add_parser(
         "classify",
         help="Decide which tracklets match the prompt (VLM or SigLIP)",
@@ -419,6 +433,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable resumable classification (default: resumable).",
     )
 
+    classify.add_argument(
+        "--no-inhibit",
+        action="store_true",
+        default=False,
+        help="Do not prevent the system from sleeping during processing",
+    )
     render = commands.add_parser(
         "render",
         help="Render a redacted video from a metadata JSON file",
@@ -468,6 +488,12 @@ def build_parser() -> argparse.ArgumentParser:
             "rest (faster, visually identical; default). Use --no-selective "
             "for a full re-encode with --crf/--preset applied everywhere"
         ),
+    )
+    render.add_argument(
+        "--no-inhibit",
+        action="store_true",
+        default=False,
+        help="Do not prevent the system from sleeping during processing",
     )
     _add_stability_args(render)
 
@@ -719,6 +745,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Use the single-pass streaming pipeline (experimental)",
+    )
+    run.add_argument(
+        "--no-inhibit",
+        action="store_true",
+        default=False,
+        help="Do not prevent the system from sleeping during processing (default: inhibit if available)",
     )
     _add_stability_args(run)
     _add_scene_args(run)
@@ -1028,8 +1060,23 @@ def _cmd_render(args: argparse.Namespace) -> int:
     return 0
 
 
+def _inhibit_sleep_if_available(argv: list[str]) -> None:
+    """Re-exec under systemd-inhibit to prevent sleep, if available and not opted out."""
+    if os.environ.get("AUTO_REDACT_INHIBITED"):
+        return
+    if "--no-inhibit" in argv:
+        return
+    inhibitor = shutil.which("systemd-inhibit")
+    if inhibitor is None:
+        return
+    os.environ["AUTO_REDACT_INHIBITED"] = "1"
+    os.execvp(inhibitor, [inhibitor, "--what=sleep:idle", "--who=auto-redact",
+                          "--why=Processing video"] + sys.argv)
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    _inhibit_sleep_if_available(argv)
     # Locate a --config option (if any) and the subcommand up front so the
     # YAML values can be applied as defaults before the full parse.
     config_path = None
