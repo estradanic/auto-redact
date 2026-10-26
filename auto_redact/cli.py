@@ -428,6 +428,36 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     classify.add_argument(
+        "--prefilter",
+        choices=("none", "negatives", "positives"),
+        default="none",
+        help=(
+            "vlm only: use SigLIP as a fast pre-filter. 'negatives' lets the "
+            "VLM re-check SigLIP's negatives (catch false negatives); "
+            "'positives' re-checks SigLIP's positives (catch false positives); "
+            "'none' (default) classifies everything with the VLM"
+        ),
+    )
+    classify.add_argument(
+        "--prefilter-model",
+        default=None,
+        metavar="MODEL",
+        help="prefilter: SigLIP checkpoint (default: google/siglip2-base-patch16-224)",
+    )
+    classify.add_argument(
+        "--prefilter-threshold",
+        type=float,
+        default=None,
+        metavar="F",
+        help="prefilter: SigLIP threshold (default: 0.5)",
+    )
+    classify.add_argument(
+        "--prefilter-device",
+        default="auto",
+        metavar="DEV",
+        help="prefilter: device for SigLIP (default: auto)",
+    )
+    classify.add_argument(
         "--no-resume",
         action="store_true",
         help="Disable resumable classification (default: resumable).",
@@ -703,6 +733,31 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--prefilter",
+        choices=("none", "negatives", "positives"),
+        default="none",
+        help="vlm only: SigLIP pre-filter mode (default: none)",
+    )
+    run.add_argument(
+        "--prefilter-model",
+        default=None,
+        metavar="MODEL",
+        help="prefilter: SigLIP checkpoint (default: google/siglip2-base-patch16-224)",
+    )
+    run.add_argument(
+        "--prefilter-threshold",
+        type=float,
+        default=None,
+        metavar="F",
+        help="prefilter: SigLIP threshold (default: 0.5)",
+    )
+    run.add_argument(
+        "--prefilter-device",
+        default="auto",
+        metavar="DEV",
+        help="prefilter: device for SigLIP (default: auto)",
+    )
+    run.add_argument(
         "--keep-alive",
         default="3h",
         metavar="DUR",
@@ -840,6 +895,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
             classify_workers=args.classify_workers,
             think=args.think,
             max_image_size=args.max_image_size,
+            prefilter=getattr(args, "prefilter", "none"),
+            prefilter_model=getattr(args, "prefilter_model", None),
+            prefilter_threshold=getattr(args, "prefilter_threshold", None),
+            prefilter_device=getattr(args, "prefilter_device", "auto"),
             keep_alive=args.keep_alive,
             crf=args.crf,
             preset=args.preset,
@@ -890,6 +949,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         classify_workers=args.classify_workers,
         think=args.think,
         max_image_size=args.max_image_size,
+        prefilter=getattr(args, "prefilter", "none"),
+        prefilter_model=getattr(args, "prefilter_model", None),
+        prefilter_threshold=getattr(args, "prefilter_threshold", None),
+        prefilter_device=getattr(args, "prefilter_device", "auto"),
         crf=args.crf,
         preset=args.preset,
         selective=args.selective,
@@ -922,6 +985,8 @@ def _cmd_track(args: argparse.Namespace) -> int:
             conf=args.track_conf,
             iou=args.track_iou,
             tracker=args.track_tracker,
+            scene_cuts=args.scene_cuts,
+            scene_cut_threshold=args.scene_cut_threshold,
             meta_path=args.meta,
             force=False,
             resume=not args.no_resume,
@@ -932,12 +997,8 @@ def _cmd_track(args: argparse.Namespace) -> int:
             meta = add_orphan_tracklets(meta, args.video, on_progress=orphan_progress)
         save_meta(args.meta, meta)
     if args.scene_cuts:
-        from auto_redact.scene import apply_scene_cuts
-        with progress_bar("scene") as scene_progress:
-            meta, cuts, n_splits = apply_scene_cuts(
-                meta, threshold=args.scene_cut_threshold, on_progress=scene_progress
-            )
-        save_meta(args.meta, meta)
+        cuts = getattr(meta, "scene_cuts", [])
+        n_splits = getattr(meta, "scene_cut_splits", 0)
         print(f"scene cuts: {len(cuts)} cut(s), {n_splits} split(s)", file=sys.stderr)
     save_meta(args.meta, meta)
     print(f"wrote {len(meta.tracklets)} tracklet(s) to {args.meta}")
@@ -1028,6 +1089,10 @@ def _cmd_classify(args: argparse.Namespace) -> int:
                 workers=args.classify_workers,
                 think=args.think,
                 max_image_size=args.max_image_size,
+                prefilter=getattr(args, "prefilter", "none"),
+                prefilter_model=getattr(args, "prefilter_model", None),
+                prefilter_threshold=getattr(args, "prefilter_threshold", None),
+                prefilter_device=getattr(args, "prefilter_device", "auto"),
                 on_progress=on_progress,
                 resume=resume,
                 meta_path=args.meta,
@@ -1066,12 +1131,25 @@ def _inhibit_sleep_if_available(argv: list[str]) -> None:
         return
     if "--no-inhibit" in argv:
         return
+    # Only inhibit when invoked as the CLI entry point; programmatic callers
+    # (tests, library use) must not be re-executed.
+    prog = str(sys.argv[0]) if sys.argv else ""
+    if not (prog.endswith("auto-redact") or prog.endswith("cli.py")):
+        return
     inhibitor = shutil.which("systemd-inhibit")
     if inhibitor is None:
         return
     os.environ["AUTO_REDACT_INHIBITED"] = "1"
+    # Re-exec the same invocation under the inhibitor. Prefer the argv we
+    # were called with so programmatic callers (tests) keep their arguments;
+    # fall back to sys.argv for the CLI entry point.
+    base = list(argv) if argv else list(sys.argv[1:])
+    if not base or not os.access(sys.argv[0], os.X_OK) or str(sys.argv[0]).endswith(".py"):
+        cmd = [sys.executable, "-m", "auto_redact.cli"] + base
+    else:
+        cmd = [sys.argv[0]] + base
     os.execvp(inhibitor, [inhibitor, "--what=sleep:idle", "--who=auto-redact",
-                          "--why=Processing video"] + sys.argv)
+                          "--why=Processing video"] + cmd)
 
 
 def main(argv=None) -> int:

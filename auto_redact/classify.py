@@ -205,6 +205,15 @@ class VlmClassifier:
         return Decision(parse_yes_no(reply), None, f"reply: {reply!r}")
 
 
+
+def _siglip_type():
+    try:
+        from .siglip import SiglipClassifier
+        return SiglipClassifier
+    except Exception:
+        return type(None)
+
+
 def classify_snapshots(
     meta: Metadata,
     prompt: str,
@@ -215,6 +224,10 @@ def classify_snapshots(
     think: bool = False,
     keep_alive: str = DEFAULT_KEEP_ALIVE,
     max_image_size: int = DEFAULT_MAX_IMAGE_SIZE,
+    prefilter: str = "none",
+    prefilter_model: str = None,
+    prefilter_threshold: float = None,
+    prefilter_device: str = "auto",
     classifier: Classifier | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     workers: int = DEFAULT_WORKERS,
@@ -360,9 +373,66 @@ def classify_snapshots(
     if on_progress is not None:
         on_progress(already_done, total)
 
-    completed = already_done
-    if workers == 1:
+    # Optional SigLIP pre-filter (VLM backend only): run SigLIP first and
+    # let the VLM handle only the subset where SigLIP is least trustworthy.
+    # "negatives" -> VLM re-checks SigLIP's negatives (catches false negatives)
+    # "positives" -> VLM re-checks SigLIP's positives (catches false positives)
+    prefilter = (prefilter or "none").lower()
+    siglip = None
+    if prefilter in ("negatives", "positives") and classifier is not None and not isinstance(classifier, _siglip_type()):
+        try:
+            from .siglip import SiglipClassifier, DEFAULT_SIGLIP_MODEL, DEFAULT_THRESHOLD
+            siglip = SiglipClassifier(
+                prefilter_model or DEFAULT_SIGLIP_MODEL,
+                prefilter_threshold if prefilter_threshold is not None else DEFAULT_THRESHOLD,
+                prefilter_device,
+            )
+        except Exception:
+            siglip = None
+            prefilter = "none"
+
+    # Determine VLM subset.
+    vlm_pending = list(pending)
+    siglip_decisions: dict[int, Decision] = {}
+    if siglip is not None and pending:
         for tracklet in pending:
+            try:
+                siglip_decisions[tracklet.track_id] = siglip.classify(
+                    Path(tracklet.best_snapshot_path), prompt
+                )
+            except Exception:
+                siglip_decisions[tracklet.track_id] = Decision(None, None, "siglip error")
+        if prefilter == "negatives":
+            vlm_pending = [
+                t for t in pending
+                if siglip_decisions.get(t.track_id) is not None
+                and siglip_decisions[t.track_id].redact is False
+            ]
+        elif prefilter == "positives":
+            vlm_pending = [
+                t for t in pending
+                if siglip_decisions.get(t.track_id) is not None
+                and siglip_decisions[t.track_id].redact is True
+            ]
+
+    completed = already_done
+    # Apply SigLIP decisions to non-VLM tracklets immediately.
+    if siglip is not None:
+        for tracklet in pending:
+            if tracklet in vlm_pending:
+                continue
+            dec = siglip_decisions.get(tracklet.track_id)
+            if dec is None:
+                dec = Decision(None, None, "no siglip decision")
+            apply(tracklet, dec)
+            completed += 1
+            newly_completed += 1
+            if on_progress is not None:
+                on_progress(completed, total)
+            _maybe_save()
+
+    if workers == 1:
+        for tracklet in vlm_pending:
             apply(
                 tracklet,
                 classifier.classify(Path(tracklet.best_snapshot_path), prompt),
@@ -378,7 +448,7 @@ def classify_snapshots(
                 pool.submit(
                     classifier.classify, Path(t.best_snapshot_path), prompt
                 ): t
-                for t in pending
+                for t in vlm_pending
             }
             for future in as_completed(futures):
                 apply(futures[future], future.result())

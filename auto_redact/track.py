@@ -25,7 +25,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+import cv2
 from ultralytics import YOLO
+from .scene import _frame_hist, split_tracklets_at_cuts
 
 import os
 import json
@@ -159,10 +161,14 @@ def _track_range(
     iou: float = 0.7,
     imgsz: int | None = None,
     tracker: str = "bytetrack.yaml",
-) -> Observations:
+    scene_cuts: bool = False,
+    scene_cut_threshold: float = 0.45,
+) -> tuple[Observations, list[int]]:
     model = YOLO("yolo11n-pose.pt")
     model.to(device)
     observations: Observations = {}
+    cuts: list[int] = []
+    prev_hist = None
     # ``quantize`` replaces the deprecated ``half`` argument (which warns on
     # every call); nothing is passed for FP32 so the default applies.
     precision = {"quantize": 16} if half else {}
@@ -170,13 +176,23 @@ def _track_range(
     if imgsz is not None:
         track_kwargs["imgsz"] = imgsz
     for frame_idx, frame in iter_frames(
-        video_path, sample_rate=sample_rate, start=start, stop=stop,
+        video_path, sample_rate=1, start=start, stop=stop,
         threads=os.cpu_count(),
     ):
         on_frame()
+        if scene_cuts:
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            hist = _frame_hist(bgr)
+            if prev_hist is not None:
+                dist = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA))
+                if dist >= scene_cut_threshold:
+                    cuts.append(frame_idx)
+            prev_hist = hist
+        if sample_rate > 1 and frame_idx % sample_rate != 0:
+            continue
         for result in model.track(frame, **track_kwargs):
             _extract(result, frame_idx, observations)
-    return observations
+    return observations, cuts
 
 
 def _resolve_meta_path(
@@ -232,6 +248,8 @@ def build_tracklets(
     iou: float = 0.7,
     imgsz: int | None = None,
     tracker: str = "bytetrack.yaml",
+    scene_cuts: bool = False,
+    scene_cut_threshold: float = 0.45,
     meta_path=None,
     save_path=None,
     checkpoint_path=None,
@@ -307,9 +325,10 @@ def build_tracklets(
         if on_progress is not None:
             on_progress(obs_container["done"], max(info.frame_count, obs_container["done"]))
 
-    observations = _track_range(
+    observations, cuts = _track_range(
         video_path, device, sample_rate, 0, None, on_frame,
         half, conf, iou, imgsz, tracker,
+        scene_cuts=scene_cuts, scene_cut_threshold=scene_cut_threshold,
     )
 
     if on_progress is not None:
@@ -337,6 +356,13 @@ def build_tracklets(
         ),
         tracklets=tracklets,
     )
+
+    if scene_cuts and cuts:
+        metadata, n_splits = split_tracklets_at_cuts(metadata, cuts)
+    else:
+        n_splits = 0
+    metadata.scene_cuts = list(cuts) if scene_cuts else []
+    metadata.scene_cut_splits = n_splits
 
     if target is not None:
         try:

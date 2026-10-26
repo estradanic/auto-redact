@@ -637,7 +637,7 @@ def select_snapshots(
                             dilate=isolate_dilate,
                         )
                         tracklet.isolated_track_ids = painted
-                    if sub_isolate and sub_model is not None and not _closeup:
+                    if sub_isolate and isolate and sub_model is not None and not _closeup:
                         sub_isolate_people(
                             crop,
                             _padded_crop_window(box, width, height, padding),

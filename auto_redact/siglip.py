@@ -47,6 +47,8 @@ def derive_negatives(prompt: str) -> list[str]:
 class SiglipClassifier:
     """Zero-shot classifier using a SigLIP2 checkpoint via transformers."""
 
+    thread_safe = True  # model/processor are stateless; safe to call from worker threads
+
     def __init__(
         self,
         model: str = DEFAULT_SIGLIP_MODEL,

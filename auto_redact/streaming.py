@@ -157,6 +157,10 @@ def run_pipeline_streaming(
     classify_workers=DEFAULT_WORKERS,
     think=False,
     max_image_size=DEFAULT_MAX_IMAGE_SIZE,
+    prefilter="none",
+    prefilter_model=None,
+    prefilter_threshold=None,
+    prefilter_device="auto",
     keep_alive="3h",
     crf=18,
     preset="medium",
@@ -194,7 +198,47 @@ def run_pipeline_streaming(
     info = probe_video(video)
     device = _select_device(device)
 
-    _gpu_lock = threading.Lock()
+    class _GpuScheduler:
+        def __init__(self):
+            self._cond = threading.Condition()
+            self._high_waiters = 0
+            self._high_active = 0
+            self._low_active = 0
+
+        @contextlib.contextmanager
+        def high(self):
+            with self._cond:
+                self._high_waiters += 1
+                while self._low_active > 0 or self._high_active > 0:
+                    self._cond.wait()
+                self._high_waiters -= 1
+                self._high_active += 1
+            try:
+                yield
+            finally:
+                with self._cond:
+                    self._high_active -= 1
+                    self._cond.notify_all()
+
+        @contextlib.contextmanager
+        def low(self):
+            with self._cond:
+                while (
+                    self._high_waiters > 0
+                    or self._high_active > 0
+                    or self._low_active > 0
+                ):
+                    self._cond.wait()
+                self._low_active += 1
+            try:
+                yield
+            finally:
+                with self._cond:
+                    self._low_active -= 1
+                    self._cond.notify_all()
+
+    _gpu = _GpuScheduler()
+    _vram_watermark = [0.0]
     _state_lock = threading.Lock()
 
     def _manage_vram(tag=""):
@@ -202,10 +246,11 @@ def run_pipeline_streaming(
             try:
                 alloc = _torch.cuda.memory_allocated() / (1024**3)
                 total = _torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                if alloc > 0.85 * total:
+                if alloc > 0.75 * total and alloc > _vram_watermark[0] + 0.1:
                     progress(f"      VRAM high ({tag}): {alloc:.1f}/{total:.1f} GB")
+                    _torch.cuda.synchronize()
                     _torch.cuda.empty_cache()
-                _torch.cuda.synchronize()
+                    _vram_watermark[0] = _torch.cuda.memory_allocated() / (1024**3)
             except Exception:
                 pass
 
@@ -509,23 +554,56 @@ def run_pipeline_streaming(
                                 same_person_iou=same_person_iou, dilate=isolate_dilate,
                             )
                             isolated_ids = painted
-                        if sub_isolate and sub_model is not None and not closeup:
-                            with _gpu_lock:
-                                sub_isolate_people(crop, window, at.best_box, sub_model, dilate=isolate_dilate)
-                                _manage_vram("sub_isolate")
+                        if sub_isolate and isolate and sub_model is not None and not closeup:
+                            sub_isolate_people(crop, window, at.best_box, sub_model, dilate=isolate_dilate)
+                            _manage_vram("sub_isolate")
                         image = Image.fromarray(crop)
                         thumb_path = thumbs / f"track_{at.internal_id}.jpg"
                         image.save(thumb_path, format="JPEG", quality=90)
                         snap_path = str(thumb_path)
 
-                        # Classify (GPU lock, since ollama/VLM or SigLIP use GPU).
-                        with _gpu_lock:
-                            if classifier == "siglip":
-                                dec = siglip.classify(snap_path, prompt)
+                        # Optional SigLIP pre-filter for the VLM backend.
+                        _prefilter = (prefilter or "none").lower()
+                        _siglip_pf = None
+                        if _prefilter in ("negatives", "positives") and classifier == "vlm":
+                            try:
+                                from .siglip import SiglipClassifier, DEFAULT_SIGLIP_MODEL, DEFAULT_THRESHOLD
+                                _siglip_pf = SiglipClassifier(
+                                    prefilter_model or DEFAULT_SIGLIP_MODEL,
+                                    prefilter_threshold if prefilter_threshold is not None else DEFAULT_THRESHOLD,
+                                    prefilter_device,
+                                )
+                            except Exception:
+                                _siglip_pf = None
+                                _prefilter = "none"
+
+                        if _siglip_pf is not None:
+                            try:
+                                _sig_dec = _siglip_pf.classify(snap_path, prompt)
+                            except Exception:
+                                _sig_dec = None
+                        else:
+                            _sig_dec = None
+
+                        dec = None
+                        _use_vlm = True
+                        if _siglip_pf is not None and _sig_dec is not None:
+                            if _prefilter == "negatives" and _sig_dec.redact is False:
+                                _use_vlm = True
+                            elif _prefilter == "positives" and _sig_dec.redact is True:
+                                _use_vlm = True
                             else:
-                                clf = make_vlm()
-                                dec = clf.classify(snap_path, prompt)
-                            _manage_vram("classify")
+                                _use_vlm = False
+                                dec = _sig_dec
+                        if _use_vlm:
+                            # Classify (GPU lock, since ollama/VLM or SigLIP use GPU).
+                            with _gpu.low():
+                                if classifier == "siglip":
+                                    dec = siglip.classify(snap_path, prompt)
+                                else:
+                                    clf = make_vlm()
+                                    dec = clf.classify(snap_path, prompt)
+                                _manage_vram("classify")
                         redact = dec.redact
                         score = dec.score
         except Exception:
@@ -551,8 +629,11 @@ def run_pipeline_streaming(
             finally:
                 classify_queue.task_done()
 
-    _worker_thread = threading.Thread(target=_classify_worker, daemon=True)
-    _worker_thread.start()
+    _worker_threads = []
+    for _ in range(max(1, int(classify_workers))):
+        _t = threading.Thread(target=_classify_worker, daemon=True)
+        _t.start()
+        _worker_threads.append(_t)
 
     def close_tracklet(at: _Active):
         nonlocal next_internal_id
@@ -754,7 +835,7 @@ def run_pipeline_streaming(
         if frame_idx % sample_rate == 0:
             # Use model.track returns list; _extract fills obs dict
             obs: dict[int, list] = {}
-            with _gpu_lock:
+            with _gpu.high():
                 _track_results = list(yolo.track(frame_rgb, **track_kwargs))
                 _manage_vram("track")
             for result in _track_results:
@@ -975,11 +1056,13 @@ def run_pipeline_streaming(
             proc.wait()
 
     # Drain classification queue.
-    classify_queue.put(None)
-    try:
-        _worker_thread.join(timeout=300)
-    except Exception:
-        pass
+    for _ in range(max(1, int(classify_workers))):
+        classify_queue.put(None)
+    for _t in _worker_threads:
+        try:
+            _t.join(timeout=300)
+        except Exception:
+            pass
     try:
         _finalize_classified()
     except Exception:

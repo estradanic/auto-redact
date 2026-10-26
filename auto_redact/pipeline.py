@@ -124,6 +124,10 @@ def run_pipeline(
     classify_workers: int = DEFAULT_WORKERS,
     think: bool = False,
     max_image_size: int = DEFAULT_MAX_IMAGE_SIZE,
+    prefilter: str = "none",
+    prefilter_model: str | None = None,
+    prefilter_threshold: float | None = None,
+    prefilter_device: str = "auto",
     crf: int = DEFAULT_CRF,
     preset: str = DEFAULT_PRESET,
     selective: bool = True,
@@ -177,6 +181,8 @@ def run_pipeline(
                 iou=track_iou,
                 imgsz=track_imgsz,
                 tracker=track_tracker,
+                scene_cuts=scene_cuts,
+                scene_cut_threshold=scene_cut_threshold,
                 meta_path=meta_file,
                 force=force,
                 resume=resume,
@@ -188,12 +194,8 @@ def run_pipeline(
                     meta, video, on_progress=orphan_progress
                 )
         if scene_cuts:
-            from auto_redact.scene import apply_scene_cuts
-            progress("[1.5/4 scene] detecting scene cuts")
-            with bar("scene") as scene_progress:
-                meta, cuts, n_splits = apply_scene_cuts(
-                    meta, threshold=scene_cut_threshold, on_progress=scene_progress
-                )
+            cuts = getattr(meta, "scene_cuts", [])
+            n_splits = getattr(meta, "scene_cut_splits", 0)
             progress(
                 f"      scene cuts: {len(cuts)} cut(s), {n_splits} tracklet split(s)"
             )
@@ -287,6 +289,10 @@ def run_pipeline(
                     workers=classify_workers,
                     think=think,
                     max_image_size=max_image_size,
+                    prefilter=prefilter,
+                    prefilter_model=prefilter_model,
+                    prefilter_threshold=prefilter_threshold,
+                    prefilter_device=prefilter_device,
                     on_progress=on_progress,
                     resume=resume,
                     meta_path=meta_file,

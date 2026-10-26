@@ -12,6 +12,7 @@ into separate tracklets so each shot is classified on its own.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Callable
 
@@ -33,11 +34,23 @@ class SceneError(RuntimeError):
     """Raised when scene-cut detection cannot run."""
 
 
+
+
+def _video_frame_count(path: Path) -> int:
+    try:
+        from .frames import probe_video
+
+        return int(probe_video(path).frame_count)
+    except Exception:
+        return -1
+
+
 def detect_scene_cuts(
     video_path: str | Path,
     *,
     threshold: float = DEFAULT_CUT_THRESHOLD,
     on_progress: Callable[[int, int], None] | None = None,
+    cache_path: str | Path | None = None,
 ) -> list[int]:
     """Return frame indices that start a new shot (hard cuts only).
 
@@ -54,6 +67,21 @@ def detect_scene_cuts(
     path = Path(video_path)
     if not path.is_file():
         raise FileNotFoundError(f"no such video file: {path}")
+
+    # Reuse a cached result when available (avoids re-decoding static videos).
+    if cache_path is not None:
+        cache = Path(cache_path)
+        if cache.is_file():
+            try:
+                payload = json.loads(cache.read_text(encoding="utf-8"))
+                if (
+                    payload.get("video") == str(path.resolve())
+                    and float(payload.get("threshold")) == float(threshold)
+                    and int(payload.get("frames")) == _video_frame_count(path)
+                ):
+                    return [int(c) for c in payload.get("cuts", [])]
+            except (OSError, ValueError, TypeError):
+                pass
 
     cuts: list[int] = []
     prev_hist: np.ndarray | None = None
@@ -82,6 +110,23 @@ def detect_scene_cuts(
                 index += 1
     except av.AVError as error:
         raise SceneError(f"failed to decode {path}: {error}") from error
+
+    if cache_path is not None:
+        try:
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(cache_path).write_text(
+                json.dumps(
+                    {
+                        "video": str(path.resolve()),
+                        "threshold": float(threshold),
+                        "frames": _video_frame_count(path),
+                        "cuts": cuts,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
 
     return cuts
 
@@ -141,6 +186,7 @@ def apply_scene_cuts(
     threshold: float = DEFAULT_CUT_THRESHOLD,
     cuts: list[int] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    cache_path: str | Path | None = None,
 ) -> tuple[Metadata, list[int], int]:
     """Detect cuts (unless ``cuts`` is given) and split tracklets across them.
 
@@ -148,7 +194,8 @@ def apply_scene_cuts(
     """
     if cuts is None:
         cuts = detect_scene_cuts(
-            meta.video.path, threshold=threshold, on_progress=on_progress
+            meta.video.path, threshold=threshold, on_progress=on_progress,
+            cache_path=cache_path,
         )
     meta, n_splits = split_tracklets_at_cuts(meta, cuts)
     return meta, cuts, n_splits
