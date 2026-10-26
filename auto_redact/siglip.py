@@ -8,6 +8,10 @@ generative VLM, best for simple static attributes (clothing colour, ...).
 
 from __future__ import annotations
 
+import os
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
 from pathlib import Path
 
 from .classify import ClassifyError, Decision

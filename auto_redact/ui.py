@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import sys
 from typing import Callable, Iterator
 
@@ -53,6 +54,21 @@ class TqdmLoggingHandler(logging.Handler):
 
 
 def setup_logging() -> None:
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
     handler = TqdmLoggingHandler()
     handler.setFormatter(logging.Formatter("%(message)s"))
     logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
+    # Silence noisy third-party loggers (HTTP/model-loading chatter).
+    for name in ("transformers", "huggingface_hub", "httpx", "httpx2", "httpcore", "httpcore2", "urllib3", "filelock"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+    try:
+        from transformers.utils import logging as tlog
+        tlog.set_verbosity_error()
+    except Exception:
+        pass
+    try:
+        from huggingface_hub.utils import logging as hlog
+        hlog.set_verbosity_error()
+    except Exception:
+        pass
