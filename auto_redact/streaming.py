@@ -353,6 +353,19 @@ def run_pipeline_streaming(
     else:
         progress("      waiting for ollama to load the model")
 
+    # Shared SigLIP pre-filter instance (reused across tracklets).
+    siglip_prefilter = None
+    if (prefilter or "none").lower() in ("negatives", "positives") and classifier == "vlm":
+        try:
+            from .siglip import SiglipClassifier as _SC, DEFAULT_SIGLIP_MODEL as _DSM, DEFAULT_THRESHOLD as _DST
+            siglip_prefilter = _SC(
+                prefilter_model or _DSM,
+                prefilter_threshold if prefilter_threshold is not None else _DST,
+                prefilter_device,
+            )
+        except Exception:
+            siglip_prefilter = None
+
     def make_vlm():
         return VlmClassifier(model, ollama_url, timeout, think, keep_alive, max_image_size)
 
@@ -564,18 +577,9 @@ def run_pipeline_streaming(
 
                         # Optional SigLIP pre-filter for the VLM backend.
                         _prefilter = (prefilter or "none").lower()
-                        _siglip_pf = None
-                        if _prefilter in ("negatives", "positives") and classifier == "vlm":
-                            try:
-                                from .siglip import SiglipClassifier, DEFAULT_SIGLIP_MODEL, DEFAULT_THRESHOLD
-                                _siglip_pf = SiglipClassifier(
-                                    prefilter_model or DEFAULT_SIGLIP_MODEL,
-                                    prefilter_threshold if prefilter_threshold is not None else DEFAULT_THRESHOLD,
-                                    prefilter_device,
-                                )
-                            except Exception:
-                                _siglip_pf = None
-                                _prefilter = "none"
+                        _siglip_pf = siglip_prefilter if _prefilter in ("negatives", "positives") else None
+                        if _siglip_pf is None:
+                            _prefilter = "none"
 
                         if _siglip_pf is not None:
                             try:
