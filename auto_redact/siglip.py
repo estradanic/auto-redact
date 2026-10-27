@@ -9,12 +9,17 @@ generative VLM, best for simple static attributes (clothing colour, ...).
 from __future__ import annotations
 
 import os
+import time
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
+import logging
 from pathlib import Path
 
+from . import telemetry
 from .classify import ClassifyError, Decision
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SIGLIP_MODEL = "google/siglip2-base-patch16-224"
 DEFAULT_THRESHOLD = 0.5
@@ -74,25 +79,49 @@ class SiglipClassifier:
         from transformers import AutoModel, AutoProcessor
 
         device = self.device
+        explicit = device != "auto"
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
+            if device == "cpu":
+                logger.warning("siglip: CUDA not available, running on CPU (slow)")
         elif device.isdigit():
             device = f"cuda:{device}"
         try:
             self._processor = AutoProcessor.from_pretrained(self.model_name)
-            self._model = AutoModel.from_pretrained(self.model_name).to(device).eval()
+            model = AutoModel.from_pretrained(self.model_name).eval()
+            start = time.perf_counter()
+            try:
+                model = model.to(device)
+            except torch.cuda.OutOfMemoryError:
+                if explicit:
+                    raise
+                logger.warning(
+                    "siglip: CUDA out of memory loading %s (another process, e.g. "
+                    "ollama, may hold the GPU); falling back to CPU", self.model_name,
+                )
+                torch.cuda.empty_cache()
+                device = "cpu"
+                model = model.to(device)
+            self._model = model
         except OSError as error:
             raise ClassifyError(
                 f"could not load SigLIP model {self.model_name!r}: {error}"
             ) from error
         self._device = device
+        logger.info("siglip: %s loaded on %s (%.1fs to move)", self.model_name, device, time.perf_counter() - start)
+        telemetry.note(f"siglip_device[{self.model_name}]", device)
 
     def score(self, image_path: str | Path, prompt: str) -> float:
         """Probability (0-1) that the image matches ``prompt`` over the negatives."""
         import torch
         from PIL import Image
 
-        self._load()
+        with telemetry.timed("siglip.load"):
+            self._load()
+        with telemetry.timed(f"siglip.score[{self._device}]"):
+            return self._score(image_path, prompt, torch, Image)
+
+    def _score(self, image_path, prompt, torch, Image) -> float:
         labels = [positive_label(prompt)] + derive_negatives(prompt)
         with Image.open(image_path) as image:
             image = image.convert("RGB")

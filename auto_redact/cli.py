@@ -56,6 +56,7 @@ from .pipeline import run_pipeline, _classify_key
 from .streaming import run_pipeline_streaming
 from .track import build_tracklets
 from .scene import SceneError
+from . import telemetry
 from .ui import progress_bar, setup_logging
 
 
@@ -131,7 +132,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="auto-redact",
         description=(
             "Redact people from a video matching a prompt, "
-            'e.g. "person in a red shirt".'
+            'e.g. "person in a red shirt". Each run writes a log and '
+            "stats.json to ~/.local/state/auto-redact/runs/ (--no-stats "
+            "or AUTO_REDACT_STATS=0 to disable)."
         ),
     )
     parser.add_argument(
@@ -1154,7 +1157,9 @@ def _inhibit_sleep_if_available(argv: list[str]) -> None:
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    no_stats = "--no-stats" in argv
     _inhibit_sleep_if_available(argv)
+    argv = [tok for tok in argv if tok != "--no-stats"]
     # Locate a --config option (if any) and the subcommand up front so the
     # YAML values can be applied as defaults before the full parse.
     config_path = None
@@ -1237,17 +1242,17 @@ def main(argv=None) -> int:
                         break
         parser.set_defaults(**cfg)
     args = parser.parse_args(argv)
+    run = None if no_stats else telemetry.begin(
+        args.command, {"argv": argv, "args": vars(args)}
+    )
+    exit_code, failure = 1, None
     try:
-        if args.command == "run":
-            return _cmd_run(args)
-        if args.command == "track":
-            return _cmd_track(args)
-        if args.command == "snapshot":
-            return _cmd_snapshot(args)
-        if args.command == "classify":
-            return _cmd_classify(args)
-        if args.command == "render":
-            return _cmd_render(args)
+        handlers = {
+            "run": _cmd_run, "track": _cmd_track, "snapshot": _cmd_snapshot,
+            "classify": _cmd_classify, "render": _cmd_render,
+        }
+        exit_code = handlers[args.command](args)
+        return exit_code
     except (
         ClassifyError,
         MetaError,
@@ -1257,9 +1262,17 @@ def main(argv=None) -> int:
         FileNotFoundError,
         ValueError,
     ) as error:
+        failure = error
         print(f"auto-redact: error: {error}", file=sys.stderr)
         return 1
-    raise AssertionError(f"unhandled command {args.command!r}")  # unreachable
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        if run is not None:
+            where = telemetry.end(exit_code, failure)
+            if where is not None:
+                print(f"auto-redact: stats and logs: {where}", file=sys.stderr)
 
 
 if __name__ == "__main__":

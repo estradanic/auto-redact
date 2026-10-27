@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
+from . import telemetry
 from .meta import Metadata, save_meta, save_meta_fast
 from .track import _resolve_meta_path
 
@@ -192,16 +193,17 @@ class VlmClassifier:
         self.max_image_size = max_image_size
 
     def classify(self, image_path: str | Path, prompt: str) -> Decision:
-        reply = ask_ollama(
-            image_path,
-            build_question(prompt),
-            model=self.model,
-            ollama_url=self.ollama_url,
-            timeout=self.timeout,
-            think=self.think,
-            keep_alive=self.keep_alive,
-            max_image_size=self.max_image_size,
-        )
+        with telemetry.timed("vlm.classify"):
+            reply = ask_ollama(
+                image_path,
+                build_question(prompt),
+                model=self.model,
+                ollama_url=self.ollama_url,
+                timeout=self.timeout,
+                think=self.think,
+                keep_alive=self.keep_alive,
+                max_image_size=self.max_image_size,
+            )
         return Decision(parse_yes_no(reply), None, f"reply: {reply!r}")
 
 
@@ -230,6 +232,7 @@ def classify_snapshots(
     prefilter_device: str = "auto",
     classifier: Classifier | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    on_prefilter_progress: Callable[[int, int], None] | None = None,
     workers: int = DEFAULT_WORKERS,
     resume: bool = True,
     meta_path=None,
@@ -395,13 +398,23 @@ def classify_snapshots(
     vlm_pending = list(pending)
     siglip_decisions: dict[int, Decision] = {}
     if siglip is not None and pending:
-        for tracklet in pending:
+        total_pf = len(pending)
+        if on_prefilter_progress is not None:
+            on_prefilter_progress(0, total_pf)
+        try:
+            siglip._load()
+        except Exception as error:
+            logger.warning("siglip prefilter failed to load (%s); skipping it", error)
+        for n, tracklet in enumerate(pending, 1):
             try:
                 siglip_decisions[tracklet.track_id] = siglip.classify(
                     Path(tracklet.best_snapshot_path), prompt
                 )
-            except Exception:
+            except Exception as error:
+                logger.warning("track %s: siglip prefilter error: %s", tracklet.track_id, error)
                 siglip_decisions[tracklet.track_id] = Decision(None, None, "siglip error")
+            if on_prefilter_progress is not None:
+                on_prefilter_progress(n, total_pf)
         if prefilter == "negatives":
             vlm_pending = [
                 t for t in pending

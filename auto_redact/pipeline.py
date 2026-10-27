@@ -34,6 +34,7 @@ from .render import (
     render_redacted,
 )
 from .scene import DEFAULT_CUT_THRESHOLD, apply_scene_cuts
+from . import telemetry
 from .siglip import DEFAULT_SIGLIP_MODEL, DEFAULT_THRESHOLD, SiglipClassifier
 from .snapshot import (
     CLOSEUP_AREA_FRACTION,
@@ -170,7 +171,7 @@ def run_pipeline(
 
     if meta is None:
         progress(f"[1/4 track] tracking people in {video}")
-        with bar("track") as on_progress:
+        with telemetry.stage("track"), bar("track") as on_progress:
             meta = build_tracklets(
                 video,
                 sample_rate=sample_rate,
@@ -189,7 +190,7 @@ def run_pipeline(
             )
         if orphans:
             from auto_redact.track import add_orphan_tracklets
-            with bar("orphan") as orphan_progress:
+            with telemetry.stage("orphan"), bar("orphan") as orphan_progress:
                 meta = add_orphan_tracklets(
                     meta, video, on_progress=orphan_progress
                 )
@@ -214,7 +215,7 @@ def run_pipeline(
         progress("[2/4 snapshot] reusing existing snapshots")
     else:
         progress("[2/4 snapshot] selecting best frames")
-        with bar("snapshot") as on_progress:
+        with telemetry.stage("snapshot"), bar("snapshot") as on_progress:
             if not resume:
                 for tracklet in meta.tracklets:
                     tracklet.best_frame = None
@@ -269,7 +270,10 @@ def run_pipeline(
             siglip = SiglipClassifier(model, threshold, classify_device)
         else:
             progress("      waiting for ollama to load the model")
-        with bar("classify") as on_progress:
+        with telemetry.stage("classify"), bar("classify") as on_progress, (
+            bar("prefilter") if prefilter in ("negatives", "positives") and siglip is None
+            else contextlib.nullcontext()
+        ) as on_prefilter:
             if siglip is not None:
                 classify_snapshots(
                     meta,
@@ -294,15 +298,17 @@ def run_pipeline(
                     prefilter_threshold=prefilter_threshold,
                     prefilter_device=prefilter_device,
                     on_progress=on_progress,
+                    on_prefilter_progress=on_prefilter,
                     resume=resume,
                     meta_path=meta_file,
                 )
+        siglip = None  # let the render release its GPU memory
         save_meta(meta_file, meta)
         sidecar.write_text(json.dumps(key) + "\n", encoding="utf-8")
 
     redacted = sum(1 for t in meta.tracklets if t.redact)
     progress(f"[4/4 render] redacting {redacted} of {len(meta.tracklets)}")
-    with bar("render") as on_progress:
+    with telemetry.stage("render"), bar("render") as on_progress:
         result = render_redacted(
             meta,
             out,

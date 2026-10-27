@@ -19,9 +19,11 @@ def progress_bar(desc: str, unit: str | None = None, position: int = 0) -> Itera
 
     The bar is hidden automatically when stderr isn't a terminal.
     """
+    if desc == "prefilter" and position == 0:
+        position = 1  # shown under the (not yet advancing) classify bar
     bar = tqdm(
         desc=desc,
-        unit=unit or ("track" if desc == "classify" else "frame"),
+        unit=unit or ("track" if desc in ("classify", "prefilter") else "frame"),
         file=sys.stderr,
         disable=None,
         dynamic_ncols=True,
@@ -58,7 +60,10 @@ def setup_logging() -> None:
     os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
     handler = TqdmLoggingHandler()
     handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
+    from . import telemetry
+    telemetry.reattach_log()
     # Silence noisy third-party loggers (HTTP/model-loading chatter).
     for name in ("transformers", "huggingface_hub", "httpx", "httpx2", "httpcore", "httpcore2", "urllib3", "filelock"):
         logging.getLogger(name).setLevel(logging.ERROR)

@@ -94,7 +94,7 @@ Check `thumbs/contact_sheet.jpg` to see what the classifier sees, and the `redac
 
 ```bash
 auto-redact run --video in.mp4 --prompt "person in a suit" --out redacted.mp4 \
-    --classifier siglip --threshold 0.3 --classify-device cpu
+    --classifier siglip --threshold 0.3
 ```
 
 | | `vlm` (default) | `siglip` |
@@ -102,7 +102,7 @@ auto-redact run --video in.mp4 --prompt "person in a suit" --out redacted.mp4 \
 | Model | `gemma3:4b` via ollama (`--model`, `--ollama-url`) | `google/siglip2-base-patch16-224` via transformers (`--model`, `--device`; on `run`: `--classify-device`, since `--device` is for tracking) |
 | How | Asks "does this image show a person matching ...? yes/no" | Scores the thumbnail against the prompt and auto-derived negative labels |
 | Output | `redact` | `redact` and `score` (0-1); redacts if `score >= --threshold` (default 0.5) |
-| Benchmark | 23/24 correct, ~28 s/image | 19/24 correct at 0.5, ~1.7 s/image on CPU |
+| Benchmark | 23/24 correct, ~28 s/image | 19/24 correct at 0.5, ~1.7 s/image on CPU (faster on GPU) |
 
 Use the VLM for accuracy and subtle attributes; use SigLIP for speed on simple attributes. Its
 default threshold is conservative, and lower values (~0.15-0.3) looked better on the small
@@ -151,10 +151,45 @@ smooth_window: 9
 
 ## Hardware notes
 
-Targets modest hardware: 16 GB RAM and an NVIDIA RTX A500 with 4 GB VRAM. Tracking uses the GPU
-when available (`--device`); rendering uses the CPU unless you pass `--encoder h264_nvenc`. 4 GB is tight: while ollama holds `gemma3:4b` (~2.5 GB) on the
-GPU, SigLIP could not also load there (CUDA out of memory), so run SigLIP with `--device cpu` (`--classify-device cpu` for `run`)
-(still ~1.7 s/image) or stop ollama. Everything runs on CPU, just slower.
+Targets modest hardware: 16 GB RAM and an NVIDIA RTX A500 with 4 GB VRAM. 4 GB is tight: while
+ollama holds `gemma3:4b` (~2.5 GB) on the GPU, SigLIP may not fit next to it. With the default
+`auto` device, SigLIP tries the GPU first and, on CUDA out-of-memory, logs a warning and falls
+back to the CPU (~1.7 s/image). Stop ollama (or let it unload the model) to keep SigLIP on the
+GPU. Everything runs on CPU too, just slower.
+
+`--encoder h264_nvenc` needs free VRAM for its own CUDA context. On a 4 GB card shared with
+ollama and the SigLIP/YOLO models it can fail with `CUDA_ERROR_OUT_OF_MEMORY`. The staged render
+frees cached GPU memory first, and any NVENC failure falls back to `libx264` with a warning;
+with `--streaming` the other models are still loaded, so the fallback is more likely there.
+
+## Defaults
+
+| Component | Default | Override |
+|---|---|---|
+| Detection/tracking (YOLO11n-pose + ByteTrack) | GPU if CUDA is available, else CPU; FP16 on CUDA | `--device`, `--no-half` |
+| SigLIP classifier (`--classifier siglip`) | **GPU if available**, else CPU; CPU fallback on CUDA OOM | `--classify-device` on `run`, `--device` on `classify` |
+| SigLIP pre-filter (`--prefilter`) | **GPU if available**, else CPU; CPU fallback on CUDA OOM | `--prefilter-device` |
+| VLM classifier | `gemma3:4b` via ollama (device is ollama's choice) | `--model`, `--ollama-url` |
+| Classifier | `vlm`; SigLIP threshold 0.5 | `--classifier`, `--threshold` |
+| Pre-filter | `none` | `--prefilter {negatives,positives}` |
+| Encoder | `libx264` on CPU, selective re-encode | `--encoder h264_nvenc`, `--no-selective` |
+| Instrumentation | on | `--no-stats`, `AUTO_REDACT_STATS=0` |
+
+The device each SigLIP model actually ended up on is logged (`siglip: ... loaded on cuda`) and
+recorded in the run stats.
+
+## Instrumentation
+
+Every command writes a run directory to `~/.local/state/auto-redact/runs/<timestamp>-<command>/`
+(override the root with `AUTO_REDACT_STATS_DIR`) and prints its path when done:
+
+- `run.log`: debug log with timestamps and thread names, plus periodic RSS/GPU memory samples.
+- `stats.json`: environment (versions, GPU, ffmpeg), arguments, stage timings, per-operation
+  timing aggregates (count/total/mean/max, e.g. `siglip.score[cuda:0]`, `vlm.classify`), peak
+  RSS and GPU memory, the devices used, and any error with its traceback.
+
+When reporting a slowdown or odd behavior, attach those two files. Disable with `--no-stats`
+or `AUTO_REDACT_STATS=0`.
 
 ## Limitations
 
