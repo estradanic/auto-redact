@@ -1,46 +1,58 @@
-"""Streaming single-pass pipeline (Option A).
+"""Streaming single-pass pipeline.
 
-Reads the source video once. Tracks, scores best-view snapshots, detects scene
-cuts and classifies people as they leave the frame, and writes redacted frames
-to the output as soon as every person visible in them is decided. Frames whose
-subjects are not yet decided are buffered (spilled to disk past a threshold)
-and shipped later. Worst case (one subject present for the whole video) is
-identical to the classic pipeline, but with one decode instead of several and
-partial early output for short-lived subjects.
+Same four stages as :func:`auto_redact.pipeline.run_pipeline` (track, snapshot,
+classify, render), but overlapped instead of run back to back:
 
-This module deliberately keeps the classic ``pipeline.run_pipeline`` untouched
-so the two can be compared.
+* a **decoder thread** reads the source once and flags scene cuts;
+* the **main thread** runs YOLO/ByteTrack, assembles tracklets, and keeps the
+  best-view crop of each person as it goes (so no frame is ever re-decoded or
+  buffered for snapshotting);
+* a **classifier pool** turns a closed tracklet into a thumbnail and a decision
+  while tracking continues;
+* a **shipper thread** renders output as soon as it is final: GOPs (selective
+  mode) are copied or re-encoded independently and concatenated at the end, or
+  frames are streamed into one encoder when selective copy is unavailable.
+
+Output is identical to the staged pipeline because the boxes for any frame are
+produced by the very same :func:`auto_redact.render.redaction_boxes`, applied
+only once no undecided tracklet can still change that frame (see
+:class:`_Frontier`). A person present for the whole video therefore blocks
+output until they are classified, the same as the staged worst case.
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
-import math
+import logging
 import os
-import subprocess
+import queue
+import shutil
 import tempfile
 import threading
-import queue as _queue
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, ContextManager
+from typing import Any
 
 import cv2
 import numpy as np
 from PIL import Image
 
+from . import telemetry
 from .classify import (
     DEFAULT_MAX_IMAGE_SIZE,
     DEFAULT_MODEL,
     DEFAULT_OLLAMA_URL,
     DEFAULT_TIMEOUT,
     DEFAULT_WORKERS,
+    Decision,
     VlmClassifier,
-    classify_snapshots,
 )
 from .frames import iter_frames, probe_video
 from .meta import Metadata, MetaError, Tracklet, VideoInfo, load_meta, save_meta
+from .pipeline import _classify_key, run_pipeline
 from .render import (
     DEFAULT_BRIDGE_IOU,
     DEFAULT_CRF,
@@ -50,34 +62,36 @@ from .render import (
     DEFAULT_PRESET,
     DEFAULT_SMOOTH_WINDOW,
     ENCODERS,
-    _box_iou,
-    _clamp_box,
-    _fill_tracklet_gaps,
-    _lerp_box,
-    _smooth_boxes,
-    redaction_boxes,
-    _Segment,
-    _copy_segment,
-    _encode_segment,
+    RenderError,
+    _check_crf,
     _concat_video,
-    _mux_audio,
+    _copy_segment,
+    _encode,
+    _encode_segment,
     _keyframe_table,
+    _mux_audio,
+    nvenc_fallback_preset,
+    _Segment,
+    redaction_boxes,
+    render_redacted,
 )
-from .pipeline import _classify_key
 from .scene import _frame_hist
 from .siglip import DEFAULT_SIGLIP_MODEL, DEFAULT_THRESHOLD, SiglipClassifier
 from .snapshot import (
+    BODY_WEIGHT,
     CLOSEUP_AREA_FRACTION,
+    CONTACT_SHEET_CELL,
     DEFAULT_CONTACT_SHEET,
     DEFAULT_PADDING,
     DISTRACTOR_WEIGHT,
     EDGE_PENALTY,
     EDGE_TOLERANCE,
     HEAD_WEIGHT,
-    BODY_WEIGHT,
     ISOLATE_DILATE,
+    JPEG_QUALITY,
     SAME_PERSON_IOU,
     _clamped_area,
+    _load_yolo,
     _padded_crop_window,
     crop_snapshot,
     observation_score,
@@ -85,39 +99,394 @@ from .snapshot import (
     sub_isolate_people,
     write_contact_sheet,
 )
-try:
-    import torch as _torch
-except Exception:
-    _torch = None
-from .track import _select_device, _load_yolo, _extract, _iou, _same_video
+from .track import _extract, _same_video, _select_device
 
+logger = logging.getLogger(__name__)
 
-# Reuse the same defaults as the classic pipeline where sensible.
-DEFAULT_SPILL_THRESHOLD = 128
+_LAZY_CHUNK = 128  # frames per box computation in full re-encode mode
 
 
 @dataclass
-class _Active:
-    internal_id: int
+class _Track:
+    """A tracklet under construction plus its snapshot scratch state."""
+
+    uid: int
     tracker_id: int
-    frames: list[int] = field(default_factory=list)
-    boxes: list[list[float]] = field(default_factory=list)
-    keypoints: list[list[list[float]]] = field(default_factory=list)
-    first_frame: int = 0
-    last_frame: int = 0
-    best_frame: int | None = None
-    best_box: list[float] | None = None
-    best_score: float = -1.0
-    best_others: list[tuple[int, list[float]]] = field(default_factory=list)
+    tl: Tracklet
     closed: bool = False
+    best_score: float = -1.0
+    best_box: list[float] | None = None
+    best_crop: np.ndarray | None = None
+    best_others: list[tuple[int, list[float]]] = field(default_factory=list)
+    thumb: Image.Image | None = None
+
+    @property
+    def first(self) -> int:
+        return self.tl.frames[0]
+
+    @property
+    def last(self) -> int:
+        return self.tl.frames[-1]
 
 
-def _select_tracker_device(device):
-    return _select_device(device)
+class _Frontier:
+    """Shared tracking/decision state that decides which frames are final.
+
+    Frame ``f`` is final once nothing that is still unknown can add a box to
+    it. A tracklet influences frames from ``first - margin`` (seam bridging
+    reaches back ``max_gap`` frames) to ``last + margin``; while it is open
+    its end is unknown, and while it is closed but undecided its verdict is.
+    Tracklets not yet seen start at or after ``consumed``.
+    """
+
+    def __init__(self, info: VideoInfo, max_gap: int, smooth_window: int,
+                 bridge_iou: float, min_track_frames: int) -> None:
+        self.cv = threading.Condition()
+        self.info = info
+        self.margin = max_gap + 1
+        self.box_args = dict(
+            max_gap=max_gap, smooth_window=smooth_window,
+            bridge_iou=bridge_iou, min_track_frames=min_track_frames,
+        )
+        self.consumed = 0
+        self.done = False
+        self.fatal: BaseException | None = None
+        self.undecided: dict[int, _Track] = {}
+        self.redacted: list[Tracklet] = []
+
+    def advance(self, consumed: int) -> None:
+        with self.cv:
+            self.consumed = consumed
+            self.cv.notify_all()
+
+    def finish_tracking(self) -> None:
+        with self.cv:
+            self.done = True
+            self.cv.notify_all()
+
+    def fail(self, error: BaseException) -> None:
+        with self.cv:
+            if self.fatal is None:
+                self.fatal = error
+            self.cv.notify_all()
+
+    def add(self, track: _Track) -> None:
+        with self.cv:
+            self.undecided[track.uid] = track
+
+    def decide(self, track: _Track) -> None:
+        with self.cv:
+            self.undecided.pop(track.uid, None)
+            if track.tl.redact is True:
+                self.redacted.append(track.tl)
+            self.cv.notify_all()
+
+    def _final_locked(self, lo: int, hi: int) -> bool:
+        if not self.done and hi > self.consumed - self.margin:
+            return False
+        for t in self.undecided.values():
+            end = t.last + self.margin if t.closed else float("inf")
+            if t.first - self.margin < hi and end >= lo:
+                return False
+        return True
+
+    def wait_final(self, lo: int, hi: int) -> None:
+        with self.cv:
+            while not self._final_locked(lo, hi):
+                if self.fatal is not None:
+                    raise self.fatal
+                self.cv.wait(0.5)
+            if self.fatal is not None:
+                raise self.fatal
+
+    def ready_ranges(self, ranges: list[tuple[int, int]], taken: set[int]) -> list[int]:
+        """Block until some untaken range is final; return their indexes."""
+        with self.cv:
+            while True:
+                if self.fatal is not None:
+                    raise self.fatal
+                ready = [
+                    i for i, (lo, hi) in enumerate(ranges)
+                    if i not in taken and self._final_locked(lo, hi)
+                ]
+                if ready or len(taken) == len(ranges):
+                    return ready
+                self.cv.wait(0.5)
+
+    def boxes_for(self, lo: int, hi: int) -> dict[int, list]:
+        """Redaction boxes for frames ``[lo, hi)``; the range must be final."""
+        with self.cv:
+            subset = [
+                tl for tl in self.redacted
+                if tl.frames[-1] >= lo - self.margin and tl.frames[0] < hi + self.margin
+            ]
+        meta = Metadata(video=self.info, tracklets=subset)
+        return redaction_boxes(meta, **self.box_args)
 
 
-def _bgr(frame_rgb):
-    return cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+class _LazyBoxes:
+    """``boxes.get(frame)`` that blocks until the frame is final.
+
+    Lets the staged ``_encode`` loop run unchanged while it is fed by an
+    ongoing analysis: it decodes frame N, asks for its boxes, and waits here
+    until they cannot change any more.
+    """
+
+    def __init__(self, frontier: _Frontier, frame_count: int) -> None:
+        self.frontier = frontier
+        self.frame_count = frame_count
+        self.chunk = -1
+        self.boxes: dict[int, list] = {}
+        self.shipped = 0
+
+    def get(self, idx: int, default=()):
+        chunk = idx // _LAZY_CHUNK
+        if chunk != self.chunk:
+            lo = chunk * _LAZY_CHUNK
+            hi = lo + _LAZY_CHUNK
+            with telemetry.timed("ship.wait_final"):
+                self.frontier.wait_final(lo, hi)
+            self.boxes = self.frontier.boxes_for(lo, hi)
+            self.chunk = chunk
+        self.shipped = idx + 1
+        return self.boxes.get(idx, default)
+
+
+def _track_buffer(tracker: str) -> int:
+    try:
+        import yaml
+        from ultralytics.utils.checks import check_yaml
+
+        with open(check_yaml(tracker), encoding="utf-8") as handle:
+            return int(yaml.safe_load(handle)["track_buffer"])
+    except Exception:
+        return 30
+
+
+def _decode_thread(video: Path, out: queue.Queue, abort: threading.Event,
+                   scene_cuts: bool, threshold: float) -> None:
+    def put(item) -> bool:
+        while not abort.is_set():
+            try:
+                out.put(item, timeout=0.5)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    try:
+        prev = None
+        for idx, frame in iter_frames(video, sample_rate=1, threads=os.cpu_count()):
+            cut = False
+            if scene_cuts:
+                hist = _frame_hist(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                if prev is not None:
+                    dist = float(cv2.compareHist(prev, hist, cv2.HISTCMP_BHATTACHARYYA))
+                    cut = dist >= threshold
+                prev = hist
+            if not put((idx, frame, cut)):
+                return
+        put(None)
+    except BaseException as error:  # surfaced on the consumer side
+        put(error)
+
+
+class _Decider:
+    """Turns closed tracklets into snapshots and verdicts on a worker pool."""
+
+    def __init__(self, *, frontier, info, thumbs, prompt, padding, isolate,
+                 sub_isolate, closeup_area_fraction, same_person_iou,
+                 isolate_dilate, classifier, prefilter_clf, prefilter,
+                 workers) -> None:
+        self.frontier = frontier
+        self.w, self.h = info.width, info.height
+        self.thumbs = thumbs
+        self.prompt = prompt
+        self.padding = padding
+        self.isolate = isolate
+        self.closeup = closeup_area_fraction
+        self.same_person_iou = same_person_iou
+        self.dilate = isolate_dilate
+        self.clf = classifier
+        self.pre_clf = prefilter_clf
+        self.prefilter = prefilter
+        self.sub_isolate = sub_isolate
+        self.sub_model = None
+        self.sub_lock = threading.Lock()
+        if sub_isolate:
+            try:
+                self.sub_model = _load_yolo("cpu")
+            except Exception:
+                self.sub_model = None
+        self.pool = ThreadPoolExecutor(max_workers=max(1, int(workers)), thread_name_prefix="decide")
+        self.submitted = 0
+        self.completed = 0
+        self.count_lock = threading.Lock()
+
+    def submit(self, track: _Track) -> None:
+        with self.count_lock:
+            self.submitted += 1
+        self.pool.submit(self._run, track)
+
+    def _run(self, track: _Track) -> None:
+        try:
+            with telemetry.timed("decide.total"):
+                decision = self._decide(track)
+        except BaseException as error:
+            logger.warning("track %s: decision failed (%s: %s)", track.uid, type(error).__name__, error)
+            logger.debug("decision traceback", exc_info=True)
+            decision = Decision(None, None, f"error: {error}")
+        tl = track.tl
+        tl.redact, tl.score = decision.redact, decision.score
+        if decision.redact is None:
+            logger.warning("track %s: unparseable or undecided, redact left unset (%s)", track.uid, decision.detail)
+        else:
+            logger.info("track %s: redact=%s (%s)", track.uid, decision.redact, decision.detail)
+        track.best_crop = None
+        with self.count_lock:
+            self.completed += 1
+        self.frontier.decide(track)
+
+    def _snapshot(self, track: _Track) -> str | None:
+        if track.best_box is None or track.best_crop is None:
+            return None
+        box, crop, tl = track.best_box, track.best_crop, track.tl
+        window = _padded_crop_window(box, self.w, self.h, self.padding)
+        fraction = _clamped_area(box, self.w, self.h) / max(1.0, float(self.w) * float(self.h))
+        closeup = fraction >= self.closeup
+        if self.isolate and not closeup:
+            crop, painted = redact_others(
+                crop, window, box, track.best_others,
+                same_person_iou=self.same_person_iou, dilate=self.dilate,
+            )
+            tl.isolated_track_ids = painted
+        if self.sub_isolate and self.isolate and self.sub_model is not None and not closeup:
+            with self.sub_lock:
+                sub_isolate_people(crop, window, box, self.sub_model, dilate=self.dilate)
+        image = Image.fromarray(crop)
+        path = self.thumbs / f"track_{track.uid}.jpg"
+        image.save(path, format="JPEG", quality=JPEG_QUALITY)
+        image.thumbnail(CONTACT_SHEET_CELL, Image.Resampling.LANCZOS)
+        track.thumb = image
+        tl.best_snapshot_path = str(path)
+        return str(path)
+
+    def _decide(self, track: _Track) -> Decision:
+        path = self._snapshot(track)
+        if path is None:
+            return Decision(None, None, "no usable snapshot")
+        if self.pre_clf is not None:
+            try:
+                early = self.pre_clf.classify(path, self.prompt)
+            except Exception as error:
+                logger.warning("track %s: siglip prefilter error: %s", track.uid, error)
+                return Decision(None, None, "siglip error")
+            needs_vlm = early.redact is (False if self.prefilter == "negatives" else True)
+            if not needs_vlm:
+                return early
+        return self.clf.classify(path, self.prompt)
+
+    def drain(self) -> None:
+        self.pool.shutdown(wait=True)
+
+
+class _SelectiveShipper(threading.Thread):
+    """Copies or re-encodes each GOP as soon as it is final."""
+
+    def __init__(self, frontier, video, info, keyframes, work_dir, crf, preset, encoder):
+        super().__init__(name="ship", daemon=True)
+        self.frontier, self.video, self.info = frontier, video, info
+        self.keyframes, self.work_dir = keyframes, work_dir
+        self.crf, self.preset, self.encoder = crf, preset, encoder
+        bounds = sorted({0, info.frame_count, *keyframes})
+        self.gops = [
+            (a, b) for a, b in zip(bounds, bounds[1:]) if b > a
+        ]
+        self.parts: list[tuple[int, Path]] = []
+        self.shipped_frames = 0
+
+    def run(self) -> None:
+        try:
+            taken: set[int] = set()
+            while len(taken) < len(self.gops):
+                ready = self.frontier.ready_ranges(self.gops, taken)
+                for run in _consecutive(ready):
+                    lo, hi = self.gops[run[0]][0], self.gops[run[-1]][1]
+                    boxes = self.frontier.boxes_for(lo, hi)
+                    for edited, group in _split_by_edit(run, self.gops, boxes):
+                        self._ship(edited, self.gops[group[0]][0], self.gops[group[-1]][1], boxes)
+                    taken.update(run)
+        except BaseException as error:
+            self.frontier.fail(error)
+
+    def _ship(self, edited: bool, lo: int, hi: int, boxes) -> None:
+        part = self.work_dir / f"part_{lo:08d}.mp4"
+        segment = _Segment(lo, hi, edited)
+        with telemetry.timed("ship.encode" if edited else "ship.copy"):
+            if edited:
+                try:
+                    _encode_segment(self.video, part, boxes, self.keyframes, segment,
+                                    self.info, self.crf, self.preset, self.encoder)
+                except RenderError as error:
+                    if self.encoder != "h264_nvenc":
+                        raise
+                    self.preset = nvenc_fallback_preset(self.preset, error)
+                    self.encoder = "libx264"
+                    _encode_segment(self.video, part, boxes, self.keyframes, segment,
+                                    self.info, self.crf, self.preset, self.encoder)
+            else:
+                _copy_segment(self.video, part, self.keyframes, segment)
+        self.parts.append((lo, part))
+        self.shipped_frames += hi - lo
+
+
+def _consecutive(indexes: list[int]) -> list[list[int]]:
+    runs: list[list[int]] = []
+    for i in indexes:
+        if runs and runs[-1][-1] == i - 1:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    return runs
+
+
+def _split_by_edit(run, gops, boxes):
+    groups: list[tuple[bool, list[int]]] = []
+    for i in run:
+        lo, hi = gops[i]
+        edited = any(f in boxes for f in range(lo, hi))
+        if groups and groups[-1][0] == edited:
+            groups[-1][1].append(i)
+        else:
+            groups.append((edited, [i]))
+    return groups
+
+
+class _FullShipper(threading.Thread):
+    """Streams every frame through one encoder, painting as boxes finalize."""
+
+    def __init__(self, frontier, video, out, info, crf, preset, encoder):
+        super().__init__(name="ship", daemon=True)
+        self.args = (video, out, info, crf, preset, encoder)
+        self.boxes = _LazyBoxes(frontier, info.frame_count)
+        self.frontier = frontier
+
+    @property
+    def shipped_frames(self) -> int:
+        return self.boxes.shipped
+
+    def run(self) -> None:
+        video, out, info, crf, preset, encoder = self.args
+        try:
+            try:
+                _encode(video, out, self.boxes, info, crf, preset, encoder)
+            except RenderError as error:
+                if encoder != "h264_nvenc":
+                    raise
+                _encode(video, out, self.boxes, info, crf,
+                        nvenc_fallback_preset(preset, error), "libx264")
+        except BaseException as error:
+            self.frontier.fail(error)
 
 
 def run_pipeline_streaming(
@@ -162,1064 +531,362 @@ def run_pipeline_streaming(
     prefilter_threshold=None,
     prefilter_device="auto",
     keep_alive="3h",
-    crf=18,
-    preset="medium",
-    selective=True,  # accepted; streaming uses GOP append
-    encoder="libx264",
+    crf=DEFAULT_CRF,
+    preset=DEFAULT_PRESET,
+    selective=True,
+    encoder=DEFAULT_ENCODER,
     max_gap=DEFAULT_MAX_GAP,
     smooth_window=DEFAULT_SMOOTH_WINDOW,
-    bridge_iou=DEFAULT_BRIDGE_IOU,  # accepted; bridging skipped in streaming
+    bridge_iou=DEFAULT_BRIDGE_IOU,
     min_track_frames=DEFAULT_MIN_TRACK_FRAMES,
     scene_cuts=True,
     scene_cut_threshold=0.45,
-    spill_threshold=DEFAULT_SPILL_THRESHOLD,
-    bookends=True,
     progress=lambda message: None,
-    bar=lambda desc: contextlib.nullcontext(),
+    bar=lambda desc, **_: contextlib.nullcontext(),
 ) -> dict:
     if classifier not in ("vlm", "siglip"):
-        raise ValueError(f"unknown classifier {classifier!r}")
+        raise ValueError(f"unknown classifier {classifier!r}; use 'vlm' or 'siglip'")
     if model is None:
         model = DEFAULT_SIGLIP_MODEL if classifier == "siglip" else DEFAULT_MODEL
+    _check_crf(crf)
+    if encoder not in ENCODERS:
+        raise RenderError(f"encoder must be one of {ENCODERS}, got {encoder!r}")
+    if not isinstance(sample_rate, int) or isinstance(sample_rate, bool) or sample_rate < 1:
+        raise ValueError(f"sample_rate must be an integer >= 1, got {sample_rate!r}")
 
-    # Defer rendering (and frame buffering) when features that need a full pass
-    # are requested: orphan recovery and selective GOP copy. Decision-making
-    # (track + snapshot + classify) still happens in one pass.
-    defer_render = bool(orphans)
-
-    video = Path(video)
-    out = Path(out)
+    video, out = Path(video), Path(out)
+    if not video.is_file():
+        raise FileNotFoundError(f"no such video file: {video}")
     meta_file = Path(meta_path) if meta_path else out.with_name(out.stem + ".meta.json")
     thumbs = Path(thumbs_dir) if thumbs_dir else meta_file.with_name(meta_file.stem + "_thumbs")
-    thumbs.mkdir(parents=True, exist_ok=True)
     sidecar = meta_file.with_name(meta_file.name + ".classify.json")
-    ckpt_path = meta_file.with_name(meta_file.name + ".stream.ckpt.json")
-
     info = probe_video(video)
-    device = _select_device(device)
 
-    class _GpuScheduler:
-        def __init__(self):
-            self._cond = threading.Condition()
-            self._high_waiters = 0
-            self._high_active = 0
-            self._low_active = 0
-
-        @contextlib.contextmanager
-        def high(self):
-            with self._cond:
-                self._high_waiters += 1
-                while self._low_active > 0 or self._high_active > 0:
-                    self._cond.wait()
-                self._high_waiters -= 1
-                self._high_active += 1
-            try:
-                yield
-            finally:
-                with self._cond:
-                    self._high_active -= 1
-                    self._cond.notify_all()
-
-        @contextlib.contextmanager
-        def low(self):
-            with self._cond:
-                while (
-                    self._high_waiters > 0
-                    or self._high_active > 0
-                    or self._low_active > 0
-                ):
-                    self._cond.wait()
-                self._low_active += 1
-            try:
-                yield
-            finally:
-                with self._cond:
-                    self._low_active -= 1
-                    self._cond.notify_all()
-
-    _gpu = _GpuScheduler()
-    _vram_watermark = [0.0]
-    _state_lock = threading.Lock()
-
-    def _manage_vram(tag=""):
-        if _torch is not None and _torch.cuda.is_available():
-            try:
-                alloc = _torch.cuda.memory_allocated() / (1024**3)
-                total = _torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                if alloc > 0.75 * total and alloc > _vram_watermark[0] + 0.1:
-                    progress(f"      VRAM high ({tag}): {alloc:.1f}/{total:.1f} GB")
-                    _torch.cuda.synchronize()
-                    _torch.cuda.empty_cache()
-                    _vram_watermark[0] = _torch.cuda.memory_allocated() / (1024**3)
-            except Exception:
-                pass
-
-    # Reuse cached result if available (mirrors classic pipeline).
-    if (not force) and meta_file.is_file() and out.is_file():
+    # With tracking and snapshots already cached there is nothing left to
+    # overlap; the staged pipeline reuses them and only redoes what changed.
+    if not force and meta_file.is_file():
         try:
-            loaded = load_meta(meta_file)
+            cached = load_meta(meta_file)
         except MetaError:
-            loaded = None
-        if loaded is not None and _same_video(loaded, video, info):
-            key = _classify_key(prompt, classifier, model, threshold, think)
-            try:
-                stored = json.loads(sidecar.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                stored = None
-            if stored == key and all(t.redact is not None for t in loaded.tracklets):
-                progress("reusing cached result")
-                redacted = sum(1 for t in loaded.tracklets if t.redact)
-                return {"out": out, "meta_path": meta_file, "tracklets": len(loaded.tracklets), "redacted": redacted}
+            cached = None
+        if (
+            cached is not None
+            and _same_video(cached, video, info)
+            and cached.tracklets
+            and all(t.best_snapshot_path and Path(t.best_snapshot_path).is_file() for t in cached.tracklets)
+        ):
+            progress("[stream] tracking and snapshots cached; using the staged pipeline")
+            summary = run_pipeline(
+                video, prompt, out, meta_path=meta_file, thumbs_dir=thumbs, force=False,
+                sample_rate=sample_rate, device=device, half=half, resume=resume,
+                classifier=classifier, model=model, threshold=threshold,
+                classify_device=classify_device, ollama_url=ollama_url, timeout=timeout,
+                classify_workers=classify_workers, think=think, max_image_size=max_image_size,
+                prefilter=prefilter, prefilter_model=prefilter_model,
+                prefilter_threshold=prefilter_threshold, prefilter_device=prefilter_device,
+                crf=crf, preset=preset, selective=selective, encoder=encoder,
+                max_gap=max_gap, smooth_window=smooth_window, bridge_iou=bridge_iou,
+                min_track_frames=min_track_frames, scene_cuts=scene_cuts,
+                scene_cut_threshold=scene_cut_threshold, progress=progress, bar=bar,
+            )
+            return {"out": summary.out, "meta_path": summary.meta_path,
+                    "tracklets": summary.tracklets, "redacted": summary.redacted}
 
-    def _ser_active(at):
-        return {
-            "internal_id": at.internal_id,
-            "tracker_id": at.tracker_id,
-            "frames": list(at.frames),
-            "boxes": [list(b) for b in at.boxes],
-            "keypoints": [list(k) for k in at.keypoints],
-            "first_frame": at.first_frame,
-            "last_frame": at.last_frame,
-            "best_frame": at.best_frame,
-            "best_box": (None if at.best_box is None else list(at.best_box)),
-            "best_score": at.best_score,
-            "best_others": [(oid, list(ob)) for oid, ob in at.best_others],
-            "closed": at.closed,
-        }
-
-    def _deser_active(d):
-        at = _Active(internal_id=d["internal_id"], tracker_id=d["tracker_id"],
-                     first_frame=d["first_frame"])
-        at.frames = list(d["frames"])
-        at.boxes = [list(b) for b in d["boxes"]]
-        at.keypoints = [list(k) for k in d["keypoints"]]
-        at.last_frame = d["last_frame"]
-        at.best_frame = d["best_frame"]
-        at.best_box = (None if d["best_box"] is None else list(d["best_box"]))
-        at.best_score = d["best_score"]
-        at.best_others = [(oid, list(ob)) for oid, ob in d["best_others"]]
-        at.closed = d["closed"]
-        return at
-
-    checkpoint = None
-    resuming = False
-    if resume and not force and ckpt_path.is_file():
-        try:
-            checkpoint = json.loads(ckpt_path.read_text(encoding="utf-8"))
-            resuming = True
-        except (OSError, ValueError):
-            checkpoint = None
-            resuming = False
-
-    start_frame = 0
-    if resuming and checkpoint is not None:
-        start_frame = int(checkpoint.get("last_frame", -1)) + 1
-
-    # Fresh run cleanup.
-    if not resuming:
-        try:
-            growing_ts.unlink(missing_ok=True)
-        except Exception:
-            pass
-        try:
-            ckpt_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    selective_stream = False
-    gops = []
-    gop_frames = {}
-    gop_blockers = {}
-    shipped_gops = set()
-    segments = []
-    keyframes = {}
-    is_open_gop = False
-    if selective and not defer_render:
-
-        keyframes, is_open_gop = _keyframe_table(video)
-        if keyframes and not is_open_gop and 0 in keyframes:
-            selective_stream = True
-            boundaries = sorted({0, info.frame_count} | set(keyframes))
-            gops = [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1) if boundaries[i + 1] > boundaries[i]]
-        else:
-            selective_stream = False
+    device = _select_device(device)
     half = half and device.startswith("cuda")
+    w, h = info.width, info.height
+    thumbs.mkdir(parents=True, exist_ok=True)
+    out.parent.mkdir(parents=True, exist_ok=True)
 
-    # classifier instance
-    siglip = None
+    # Classifiers.
     if classifier == "siglip":
         progress("      initializing classifier model")
-        siglip = SiglipClassifier(model, threshold, classify_device)
+        clf = SiglipClassifier(model, threshold, classify_device)
     else:
         progress("      waiting for ollama to load the model")
+        clf = VlmClassifier(model, ollama_url, timeout, think, keep_alive, max_image_size)
+    pre_clf, prefilter = None, (prefilter or "none").lower()
+    if prefilter in ("negatives", "positives") and classifier == "vlm":
+        pre_clf = SiglipClassifier(
+            prefilter_model or DEFAULT_SIGLIP_MODEL,
+            prefilter_threshold if prefilter_threshold is not None else DEFAULT_THRESHOLD,
+            prefilter_device,
+        )
 
-    # Shared SigLIP pre-filter instance (reused across tracklets).
-    siglip_prefilter = None
-    if (prefilter or "none").lower() in ("negatives", "positives") and classifier == "vlm":
-        try:
-            from .siglip import SiglipClassifier as _SC, DEFAULT_SIGLIP_MODEL as _DSM, DEFAULT_THRESHOLD as _DST
-            siglip_prefilter = _SC(
-                prefilter_model or _DSM,
-                prefilter_threshold if prefilter_threshold is not None else _DST,
-                prefilter_device,
-            )
-        except Exception:
-            siglip_prefilter = None
+    # Rendering mode.
+    work_dir = Path(tempfile.mkdtemp(prefix="auto-redact-stream-"))
+    keyframes: dict[int, int] = {}
+    if selective and not orphans:
+        keyframes, open_gop = _keyframe_table(video)
+        if open_gop or 0 not in keyframes:
+            keyframes = {}
+    frontier = _Frontier(
+        VideoInfo(path=str(video), fps=info.fps, width=w, height=h, frames=info.frame_count),
+        max_gap, smooth_window, bridge_iou, min_track_frames,
+    )
+    shipper = None
+    if not orphans:
+        shipper = (
+            _SelectiveShipper(frontier, video, info, keyframes, work_dir, crf, preset, encoder)
+            if keyframes else _FullShipper(frontier, video, out, info, crf, preset, encoder)
+        )
+    telemetry.note("stream.render_mode", "none (orphans)" if shipper is None else
+                   "selective" if keyframes else "full")
 
-    def make_vlm():
-        return VlmClassifier(model, ollama_url, timeout, think, keep_alive, max_image_size)
+    decider = _Decider(
+        frontier=frontier, info=info, thumbs=thumbs, prompt=prompt.strip(), padding=padding,
+        isolate=isolate, sub_isolate=sub_isolate, closeup_area_fraction=closeup_area_fraction,
+        same_person_iou=same_person_iou, isolate_dilate=isolate_dilate, classifier=clf,
+        prefilter_clf=pre_clf, prefilter=prefilter, workers=classify_workers,
+    )
 
-    yolo = _load_yolo(device if device != "auto" else None)
-    # ensure on device
-    try:
-        yolo.to(device)
-    except Exception:
-        pass
+    from ultralytics import YOLO
 
-    w, h = info.width, info.height
-    fps = info.fps
-
-    # state
-    next_internal_id = 1
-    active: dict[int, _Active] = {}  # tracker_id -> active
-    closed_tracklets: list[_Active] = []
-    redact_by_id: dict[int, bool | None] = {}
-    score_by_id: dict[int, float | None] = {}
-    snapshot_path_by_id: dict[int, str | None] = {}
-    isolated_by_id: dict[int, list[int]] = {}
-    best_frame_by_id: dict[int, int | None] = {}
-
-    # render boxes accumulated as tracklets close
-    render_boxes: dict[int, list[tuple[int, int, int, int]]] = {}
-    closed_redacted: list[_Active] = []
-    unblock_at: dict[int, set[int]] = {}
-
-    # frame buffer: idx -> ndarray or Path (spilled)
-    frame_buffer: dict[int, Any] = {}
-    spill_dir = Path(tempfile.mkdtemp(prefix="auto-redact-stream-"))
-    growing_ts = out.with_suffix(".ts")
-    in_memory_count = [0]
-
-    frame_blockers: dict[int, set[int]] = {}
-
-    next_ship = [0]
-
-    # Restore from checkpoint if resuming.
-    if resuming and checkpoint is not None:
-        next_internal_id = int(checkpoint.get("next_internal_id", next_internal_id))
-        # closed tracklets
-        for d in checkpoint.get("closed", []):
-            at = _deser_active(d["active"])
-            closed_tracklets.append(at)
-            redact_by_id[at.internal_id] = d.get("redact")
-            score_by_id[at.internal_id] = d.get("score")
-            snapshot_path_by_id[at.internal_id] = d.get("snapshot_path")
-            isolated_by_id[at.internal_id] = list(d.get("isolated") or [])
-            best_frame_by_id[at.internal_id] = d.get("best_frame")
-            if d.get("redact") is True:
-                closed_redacted.append(at)
-        # active tracklets
-        for d in checkpoint.get("active", []):
-            at = _deser_active(d)
-            active[at.tracker_id] = at
-        # render boxes
-        for k, v in (checkpoint.get("render_boxes") or {}).items():
-            render_boxes[int(k)] = [tuple(b) for b in v]
-        # shipped gops
-        for gs in checkpoint.get("shipped_gops", []):
-            shipped_gops.add(int(gs))
-        # gop frames (re-decode)
-        for gs, idxs in (checkpoint.get("gop_frames") or {}).items():
-            gop_frames[int(gs)] = []
-            for idx in idxs:
-                fr = None
-                for fi, f in iter_frames(video, start=idx, stop=idx + 1):
-                    fr = f
-                    break
-                if fr is not None:
-                    gop_frames[int(gs)].append((idx, fr))
-        # gop blockers
-        for gs, ids in (checkpoint.get("gop_blockers") or {}).items():
-            gop_blockers[int(gs)] = set(ids)
-        # frame buffer (re-decode)
-        for idx in checkpoint.get("frame_buffer_indices", []):
-            fr = None
-            for fi, f in iter_frames(video, start=idx, stop=idx + 1):
-                fr = f
-                break
-            if fr is not None:
-                frame_buffer[idx] = fr
-                in_memory_count[0] += 1
-        next_ship[0] = int(checkpoint.get("next_ship", next_ship[0]))
-
-    # ffmpeg
-    out.parent.mkdir(parents=True, exist_ok=True)
-    has_audio = info.has_audio
-
-    out.parent.mkdir(parents=True, exist_ok=True)
-    has_audio = info.has_audio
-    cmd = [
-        "ffmpeg", "-v", "error", "-y",
-        "-f", "rawvideo", "-pixel_format", "rgb24",
-        "-video_size", f"{w}x{h}",
-        "-framerate", f"{int(fps)}/{1}" if float(fps).is_integer() else str(fps),
-        "-i", "pipe:0",
-    ]
-    # use fps arg helper-ish
-    from fractions import Fraction
-    rate = Fraction(fps).limit_denominator(1001)
-    cmd = [
-        "ffmpeg", "-v", "error", "-y",
-        "-f", "rawvideo", "-pixel_format", "rgb24",
-        "-video_size", f"{w}x{h}",
-        "-framerate", f"{rate.numerator}/{rate.denominator}",
-        "-i", "pipe:0",
-    ]
-    if has_audio:
-        cmd += ["-i", str(video)]
-    cmd += ["-map", "0:v:0"]
-    if has_audio:
-        cmd += ["-map", "1:a:0", "-c:a", "copy"]
-    cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", preset,
-            "-pix_fmt", "yuv420p", "-movflags", "frag_keyframe+empty_moov", str(out)]
-    proc = None
-    if not defer_render and not selective_stream:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-    sub_model = None
-    if sub_isolate:
-        try:
-            sub_model = _load_yolo("cpu")
-        except Exception:
-            sub_model = None
-
-    precision = {"quantize": 16} if half else {}
-    track_kwargs = dict(conf=track_conf, iou=track_iou, persist=True, verbose=False, tracker=track_tracker, **precision)
+    yolo = YOLO("yolo11n-pose.pt")
+    yolo.to(device)
+    track_kwargs = dict(conf=track_conf, iou=track_iou, persist=True, verbose=False, tracker=track_tracker)
+    if half:
+        track_kwargs["quantize"] = 16
     if track_imgsz is not None:
         track_kwargs["imgsz"] = track_imgsz
+    # ByteTrack drops a lost id after ``track_buffer`` tracker steps and never
+    # reuses it, so a tracklet silent for longer than that is complete.
+    close_gap = (_track_buffer(track_tracker) + 2) * sample_rate
 
-    close_threshold = max_gap if max_gap > 0 else 30
+    tracks: list[_Track] = []
+    open_tracks: dict[int, _Track] = {}
+    cuts: list[int] = []
+    next_uid = 1
 
-    def spill_one():
-        # spill the earliest in-memory frame that is blocked (not shippable now)
-        candidates = [idx for idx, v in frame_buffer.items() if not isinstance(v, Path)]
-        if not candidates:
-            return
-        candidates.sort()
-        # prefer one that can't ship now
-        target = None
-        for idx in candidates:
-            if idx != next_ship[0]:
-                target = idx
-                break
-        if target is None:
-            target = candidates[0]
-        arr = frame_buffer.pop(target)
-        path = spill_dir / f"frame_{target}.npy"
-        np.save(path, arr)
-        frame_buffer[target] = path
-        in_memory_count[0] -= 1
+    def close(track: _Track) -> None:
+        track.closed = True
+        decider.submit(track)
 
-    def store_frame(idx, arr):
-        if in_memory_count[0] >= spill_threshold:
-            spill_one()
-        frame_buffer[idx] = arr
-        in_memory_count[0] += 1
+    abort = threading.Event()
+    frames_q: queue.Queue = queue.Queue(maxsize=6)
+    decoder = threading.Thread(
+        target=_decode_thread, name="decode", daemon=True,
+        args=(video, frames_q, abort, scene_cuts, scene_cut_threshold),
+    )
 
-    def load_frame(idx):
-        v = frame_buffer.get(idx)
-        if isinstance(v, Path):
-            return np.load(v)
-        return v
-
-    # Async classification setup.
-    classify_queue = _queue.Queue()
-    classified_ids = set()
-    tracklet_by_id = {}
-    pending_results = {}
-    _finalized_ids = set()
-
-    def _classify_one(at):
-        """Worker: decode best frame, crop, isolate, classify. Runs in background."""
-        redact = None
-        score = None
-        snap_path = None
-        isolated_ids = []
-        try:
-            if at.best_box is not None and at.best_frame is not None:
-                best_arr = None
-                for fi, fr in iter_frames(video, start=at.best_frame, stop=at.best_frame + 1):
-                    best_arr = fr
-                    break
-                if best_arr is not None:
-                    try:
-                        crop = crop_snapshot(best_arr, at.best_box, padding)
-                    except Exception:
-                        crop = None
-                    if crop is not None:
-                        from .snapshot import _padded_crop_window, _clamped_area
-                        window = _padded_crop_window(at.best_box, w, h, padding)
-                        area_fraction = _clamped_area(at.best_box, w, h) / max(1.0, float(w) * float(h))
-                        closeup = area_fraction >= closeup_area_fraction
-                        if isolate and not closeup:
-                            crop, painted = redact_others(
-                                crop, window, at.best_box, at.best_others,
-                                same_person_iou=same_person_iou, dilate=isolate_dilate,
-                            )
-                            isolated_ids = painted
-                        if sub_isolate and isolate and sub_model is not None and not closeup:
-                            sub_isolate_people(crop, window, at.best_box, sub_model, dilate=isolate_dilate)
-                            _manage_vram("sub_isolate")
-                        image = Image.fromarray(crop)
-                        thumb_path = thumbs / f"track_{at.internal_id}.jpg"
-                        image.save(thumb_path, format="JPEG", quality=90)
-                        snap_path = str(thumb_path)
-
-                        # Optional SigLIP pre-filter for the VLM backend.
-                        _prefilter = (prefilter or "none").lower()
-                        _siglip_pf = siglip_prefilter if _prefilter in ("negatives", "positives") else None
-                        if _siglip_pf is None:
-                            _prefilter = "none"
-
-                        if _siglip_pf is not None:
-                            try:
-                                _sig_dec = _siglip_pf.classify(snap_path, prompt)
-                            except Exception:
-                                _sig_dec = None
-                        else:
-                            _sig_dec = None
-
-                        dec = None
-                        _use_vlm = True
-                        if _siglip_pf is not None and _sig_dec is not None:
-                            if _prefilter == "negatives" and _sig_dec.redact is False:
-                                _use_vlm = True
-                            elif _prefilter == "positives" and _sig_dec.redact is True:
-                                _use_vlm = True
-                            else:
-                                _use_vlm = False
-                                dec = _sig_dec
-                        if _use_vlm:
-                            # Classify (GPU lock, since ollama/VLM or SigLIP use GPU).
-                            with _gpu.low():
-                                if classifier == "siglip":
-                                    dec = siglip.classify(snap_path, prompt)
-                                else:
-                                    clf = make_vlm()
-                                    dec = clf.classify(snap_path, prompt)
-                                _manage_vram("classify")
-                        redact = dec.redact
-                        score = dec.score
-        except Exception:
-            redact = None
-            score = None
-
-        with _state_lock:
-            pending_results[at.internal_id] = (redact, score, snap_path, isolated_ids)
-            classified_ids.add(at.internal_id)
-
-    def _classify_worker():
-        while True:
-            at = classify_queue.get()
-            if at is None:
-                classify_queue.task_done()
-                break
-            try:
-                _classify_one(at)
-            except Exception:
-                with _state_lock:
-                    pending_results[at.internal_id] = (None, None, None, [])
-                    classified_ids.add(at.internal_id)
-            finally:
-                classify_queue.task_done()
-
-    _worker_threads = []
-    for _ in range(max(1, int(classify_workers))):
-        _t = threading.Thread(target=_classify_worker, daemon=True)
-        _t.start()
-        _worker_threads.append(_t)
-
-    def close_tracklet(at: _Active):
-        nonlocal next_internal_id
-        if at.closed:
-            return
-        at.closed = True
-        tracklet_by_id[at.internal_id] = at
-        closed_tracklets.append(at)
-
-        # Schedule unblock (hold for bridging window).
-        if max_gap > 0:
-            unblock_frame = at.last_frame + max_gap + 1
-            unblock_at.setdefault(unblock_frame, set()).add(at.internal_id)
-        else:
-            for idx in list(frame_blockers.keys()):
-                if at.internal_id in frame_blockers[idx]:
-                    frame_blockers[idx].discard(at.internal_id)
-            for gs in list(gop_blockers.keys()):
-                gop_blockers[gs].discard(at.internal_id)
-
-        # Push to classification queue (async).
-        classify_queue.put(at)
-
-    def _finalize_classified():
-        """Process any newly classified tracklets: render boxes, bridging, meta write."""
-        newly = []
-        with _state_lock:
-            for tid in list(classified_ids):
-                if tid in _finalized_ids:
-                    continue
-                if tid not in pending_results:
-                    continue
-                newly.append(tid)
-        for tid in newly:
-            with _state_lock:
-                redact, score, snap_path, isolated_ids = pending_results[tid]
-                at = tracklet_by_id[tid]
-            # compute render boxes if redacted
-            if redact is True:
-                filled_frames, filled_boxes = _fill_tracklet_gaps(at.frames, at.boxes, max_gap)
-                if smooth_window > 1 and len(filled_boxes) > 1:
-                    filled_boxes = _smooth_boxes(filled_frames, filled_boxes, smooth_window)
-                for f, box in zip(filled_frames, filled_boxes):
-                    pb = _clamp_box(box, w, h)
-                    if pb is not None:
-                        render_boxes.setdefault(f, []).append(pb)
-                # bridging
-                if bridge_iou > 0 and max_gap > 0:
-                    with _state_lock:
-                        for prev in closed_redacted:
-                            gap = at.first_frame - prev.last_frame - 1
-                            if not (0 < gap <= max_gap):
-                                continue
-                            if _box_iou(prev.boxes[-1], at.boxes[0]) < bridge_iou:
-                                continue
-                            for step in range(1, gap + 1):
-                                t = step / (gap + 1)
-                                box = _lerp_box(prev.boxes[-1], at.boxes[0], t)
-                                frame_idx = prev.last_frame + step
-                                pb = _clamp_box(box, w, h)
-                                if pb is not None:
-                                    render_boxes.setdefault(frame_idx, []).append(pb)
-                        closed_redacted.append(at)
-            # store results
-            redact_by_id[tid] = redact
-            score_by_id[tid] = score
-            snapshot_path_by_id[tid] = snap_path
-            isolated_by_id[tid] = isolated_ids
-            best_frame_by_id[tid] = at.best_frame
-            # periodic meta write
-            try:
-                _tmp_tracklets = []
-                with _state_lock:
-                    _closed = list(closed_tracklets)
-                for _at in sorted(_closed, key=lambda a: a.internal_id):
-                    _tmp_tracklets.append(Tracklet(
-                        track_id=_at.internal_id,
-                        frames=list(_at.frames),
-                        boxes=[list(b) for b in _at.boxes],
-                        keypoints=[list(k) for k in _at.keypoints],
-                        best_frame=best_frame_by_id.get(_at.internal_id),
-                        best_snapshot_path=snapshot_path_by_id.get(_at.internal_id),
-                        isolated_track_ids=list(isolated_by_id.get(_at.internal_id, [])),
-                        redact=redact_by_id.get(_at.internal_id),
-                        score=score_by_id.get(_at.internal_id),
-                    ))
-                save_meta(meta_file, Metadata(video=VideoInfo(path=str(video), fps=fps, width=w, height=h, frames=info.frame_count), tracklets=_tmp_tracklets))
-            except Exception:
-                pass
-            with _state_lock:
-                _finalized_ids.add(tid)
-
-    # Main pass
-    def save_checkpoint(last_frame):
-        try:
-            data = {
-                "last_frame": last_frame,
-                "next_internal_id": next_internal_id,
-                "shipped_gops": sorted(shipped_gops),
-                "closed": [
-                    {"active": _ser_active(at),
-                     "redact": redact_by_id.get(at.internal_id),
-                     "score": score_by_id.get(at.internal_id),
-                     "snapshot_path": snapshot_path_by_id.get(at.internal_id),
-                     "isolated": isolated_by_id.get(at.internal_id, []),
-                     "best_frame": best_frame_by_id.get(at.internal_id)}
-                    for at in closed_tracklets
-                ],
-                "active": [_ser_active(at) for at in active.values()],
-                "render_boxes": {str(k): [list(b) for b in v] for k, v in render_boxes.items()},
-                "gop_frames": {str(gs): [fi for fi, _ in frames] for gs, frames in gop_frames.items()},
-                "gop_blockers": {str(gs): sorted(bs) for gs, bs in gop_blockers.items()},
-                "next_ship": next_ship[0],
-                "frame_buffer_indices": sorted(frame_buffer.keys()),
-            }
-            ckpt_path.write_text(json.dumps(data))
-        except Exception:
-            pass
-
-    prev_hist = None
-    total = info.frame_count
-    progress(f"[stream] tracking+rendering {video}")
-
-    # We'll iterate all frames
-    frame_iter = iter_frames(video, sample_rate=1, start=start_frame)
-    # track sampled frames separately; but iter_frames sample_rate=1 yields all.
-    last_seen_global = 0
-
-    # Multiple concurrent bars: track, classify, ship.
-    _track_bar_ctx = None
-    _track_on_progress = None
-    _classify_bar_ctx = None
-    _classify_on_progress = None
-    _ship_bar_ctx = None
-    _ship_on_progress = None
-
-    def _open_bar(desc, position):
-        nonlocal _track_bar_ctx, _track_on_progress
-        # Try position-aware; fall back for test fakes.
+    score_kwargs = dict(
+        padding=padding, head_weight=head_weight, body_weight=body_weight,
+        edge_penalty=edge_penalty, edge_tolerance=edge_tolerance,
+        distractor_weight=distractor_weight,
+    )
+    progress(f"[stream] tracking, classifying and rendering {video}")
+    bars = contextlib.ExitStack()
+    cbs: dict[str, Any] = {}
+    for position, desc in enumerate(("track", "classify", "ship")):
         try:
             ctx = bar(desc, position=position)
         except TypeError:
             ctx = bar(desc)
-        cb = ctx.__enter__()
-        return ctx, cb
+        cbs[desc] = bars.enter_context(ctx)
+
+    def report(frame_idx: int) -> None:
+        if cbs["track"]:
+            cbs["track"](frame_idx + 1, max(info.frame_count, frame_idx + 1))
+        if cbs["classify"]:
+            cbs["classify"](decider.completed, max(1, decider.submitted))
+        if cbs["ship"] and shipper is not None:
+            cbs["ship"](shipper.shipped_frames, max(1, info.frame_count))
 
     try:
-        _track_bar_ctx, _track_on_progress = _open_bar("track", 0)
-    except Exception:
-        _track_bar_ctx = None
-        _track_on_progress = None
-    try:
-        _classify_bar_ctx, _classify_on_progress = _open_bar("classify", 1)
-    except Exception:
-        _classify_bar_ctx = None
-        _classify_on_progress = None
-    try:
-        _ship_bar_ctx, _ship_on_progress = _open_bar("ship", 2)
-    except Exception:
-        _ship_bar_ctx = None
-        _ship_on_progress = None
-
-    for frame_idx, frame_rgb in frame_iter:
-        if _track_on_progress is not None:
-            try:
-                _track_on_progress(frame_idx + 1, total)
-            except Exception:
-                pass
-        if _classify_on_progress is not None:
-            try:
-                # classified count = number of finalized tracklets
-                _classify_on_progress(len(_finalized_ids), max(1, len(closed_tracklets) + 1))
-            except Exception:
-                pass
-        if _ship_on_progress is not None:
-            try:
-                _ship_on_progress(next_ship[0] if not selective_stream else len(shipped_gops), total)
-            except Exception:
-                pass
-        # checkpoint previous frame's state
-        if frame_idx > start_frame and (frame_idx - 1) % 50 == 0:
-            try:
-                save_checkpoint(frame_idx - 1)
-            except Exception:
-                pass
-        # progress
-
-        # scene cut
-        bgr = _bgr(frame_rgb)
-        hist = _frame_hist(bgr)
-        if prev_hist is not None and scene_cuts:
-            dist = float(__import__("cv2").compareHist(prev_hist, hist, __import__("cv2").HISTCMP_BHATTACHARYYA))
-            if dist >= scene_cut_threshold:
-                for tid in list(active.keys()):
-                    close_tracklet(active.pop(tid))
-        prev_hist = hist
-
-        # tracking on sampled frames
-        if frame_idx % sample_rate == 0:
-            # Use model.track returns list; _extract fills obs dict
-            obs: dict[int, list] = {}
-            with _gpu.high():
-                _track_results = list(yolo.track(frame_rgb, **track_kwargs))
-                _manage_vram("track")
-            for result in _track_results:
-                _extract(result, frame_idx, obs)
-            # obs: tid -> [(frame_idx, box, kps)]
-            for tid, frames_obs in obs.items():
-                for (fi, box, kps) in frames_obs:
-                    if tid not in active:
-                        at = _Active(internal_id=next_internal_id, tracker_id=tid, first_frame=fi)
-                        next_internal_id += 1
-                        active[tid] = at
-                    at = active[tid]
-                    if at.closed:
-                        # reopen as new tracklet
-                        at = _Active(internal_id=next_internal_id, tracker_id=tid, first_frame=fi)
-                        next_internal_id += 1
-                        active[tid] = at
-                    at.frames.append(fi)
-                    at.boxes.append(list(box))
-                    at.keypoints.append(kps)
-                    at.last_frame = fi
-                    # scoring
-                    # build frame obs list for this frame from active tracklets observed this frame
-                    # We'll score after collecting all tids for this frame; but we need all boxes.
-                    pass
-            # Now score best snapshots for tracklets observed this frame.
-            # Build list of (internal_id, box) for tracklets observed in this frame.
-            frame_obs_list = []
-            for tid, frames_obs in obs.items():
-                at = active.get(tid)
-                if at is None or at.closed:
-                    continue
-                # find the box for this frame (last appended)
-                frame_obs_list.append((at.internal_id, list(at.boxes[-1]), at.keypoints[-1] if at.keypoints else []))
-            # for each, score
-            for internal_id, box, kps in frame_obs_list:
-                others = [(oid, obox) for (oid, obox, _) in [(x[0], x[1], None) for x in frame_obs_list] if oid != internal_id]
-                # others need boxes
-                other_boxes = [obox for (oid, obox, _) in [(x[0], x[1], None) for x in frame_obs_list] if oid != internal_id]
-                # reconstruct other_boxes properly
-                other_boxes = [x[1] for x in frame_obs_list if x[0] != internal_id]
-                score = observation_score(
-                    box, kps, w, h, other_boxes,
-                    padding=padding, head_weight=head_weight, body_weight=body_weight,
-                    edge_penalty=edge_penalty, edge_tolerance=edge_tolerance,
-                    distractor_weight=distractor_weight, same_person_iou=same_person_iou,
-                )
-                # find active at
-                at = None
-                for a in active.values():
-                    if a.internal_id == internal_id:
-                        at = a
-                        break
-                if at is None:
-                    continue
-                if score > at.best_score:
-                    at.best_score = score
-                    at.best_box = list(box)
-                    at.best_frame = frame_idx
-                    at.best_others = [(oid, list(obox)) for (oid, obox, _) in [(x[0], x[1], None) for x in frame_obs_list] if oid != internal_id]
-                    # fix best_others to use boxes
-                    at.best_others = [(oid, list(obox)) for oid, obox in [(x[0], x[1]) for x in frame_obs_list] if oid != internal_id]
-
-        # update last_seen for active tracklets observed this frame
-        observed_ids = set()
-        if frame_idx % sample_rate == 0:
-            for tid in obs.keys():
-                observed_ids.add(tid)
-        for tid, at in list(active.items()):
-            if at.closed:
-                continue
-            if tid in observed_ids:
-                at.last_frame = frame_idx
-            else:
-                # dropout close
-                if frame_idx - at.last_frame > close_threshold:
-                    close_tracklet(active.pop(tid))
-
-        def _gop_start_of(fidx):
-            for gs, ge in gops:
-                if gs <= fidx < ge:
-                    return gs
-            return gops[-1][0] if gops else 0
-
-        # process scheduled unblocks (bridging hold)
-        if frame_idx in unblock_at:
-            for tid in list(unblock_at.pop(frame_idx)):
-                with _state_lock:
-                    is_classified = tid in classified_ids
-                if is_classified:
-                    for idx in list(frame_blockers.keys()):
-                        if tid in frame_blockers[idx]:
-                            frame_blockers[idx].discard(tid)
-                    for gs in list(gop_blockers.keys()):
-                        gop_blockers[gs].discard(tid)
-                else:
-                    # reschedule
-                    unblock_at.setdefault(frame_idx + 1, set()).add(tid)
-
-        # Process newly classified tracklets (render boxes, bridging, meta).
-        try:
-            _finalize_classified()
-        except Exception:
-            pass
-
-        if selective_stream:
-            gs = _gop_start_of(frame_idx)
-            gop_frames.setdefault(gs, []).append((frame_idx, frame_rgb))
-            # track blockers for this GOP
-            blockers = gop_blockers.setdefault(gs, set())
-            for tid, at in active.items():
-                if at.closed:
-                    continue
-                if at.first_frame <= frame_idx <= at.last_frame + max_gap:
-                    blockers.add(at.internal_id)
-            # try to ship fully-buffered GOPs in order
-            for gstart, gend in gops:
-                if gstart in shipped_gops:
-                    continue
-                if gend > frame_idx + 1:
+        with bars, telemetry.stage("stream"):
+            if shipper is not None:
+                shipper.start()
+            decoder.start()
+            last_idx = -1
+            while True:
+                with telemetry.timed("stream.decode_wait"):
+                    item = frames_q.get()
+                if item is None:
                     break
-                if gop_blockers.get(gstart):
-                    break
-                # ship this GOP
-                frames = gop_frames.pop(gstart, [])
-                edited = any(idx in render_boxes for idx, _ in frames)
-                seg = _Segment(gstart, gend, edited)
-                seg_path = Path(tempfile.mkdtemp(prefix="auto-redact-gop-")) / f"gop_{gstart:06d}.mp4"
-                # reuse a single temp dir? use spill_dir
-                seg_path = spill_dir / f"gop_{gstart:06d}.ts"
-                if edited:
-                    _encode_segment(video, seg_path, render_boxes, keyframes, seg, info, crf, preset, encoder)
-                else:
-                    _copy_segment(video, seg_path, keyframes, seg)
-                # Append this GOP to the growing TS file for mid-run playability.
-                with open(growing_ts, "ab") as _f:
-                    _f.write(seg_path.read_bytes())
-                try:
-                    seg_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                segments.append(seg_path)
-                shipped_gops.add(gstart)
-        elif not defer_render:
-            # blockers for this frame
-            blockers = set()
-            for tid, at in active.items():
-                if at.closed:
-                    continue
-                if at.first_frame <= frame_idx <= at.last_frame + max_gap:
-                    blockers.add(at.internal_id)
-            frame_blockers[frame_idx] = blockers
+                if isinstance(item, BaseException):
+                    raise item
+                frame_idx, frame, cut = item
+                if frontier.fatal is not None:
+                    raise frontier.fatal
+                last_idx = frame_idx
+                if cut:
+                    cuts.append(frame_idx)
+                    for track in list(open_tracks.values()):
+                        close(track)
+                    open_tracks.clear()
 
-            # store frame
-            store_frame(frame_idx, frame_rgb)
+                if frame_idx % sample_rate == 0:
+                    obs: dict[int, list] = {}
+                    with telemetry.timed("stream.yolo"):
+                        for result in yolo.track(frame, **track_kwargs):
+                            _extract(result, frame_idx, obs)
+                    frame_obs: list[tuple[_Track, list[float], list]] = []
+                    for tid, observations in obs.items():
+                        for _fi, box, kps in observations:
+                            track = open_tracks.get(tid)
+                            fresh = track is None
+                            if fresh:
+                                tl = Tracklet(track_id=next_uid, frames=[], boxes=[], keypoints=[])
+                                track = _Track(uid=next_uid, tracker_id=tid, tl=tl)
+                                next_uid += 1
+                                open_tracks[tid] = track
+                                tracks.append(track)
+                            track.tl.frames.append(frame_idx)
+                            track.tl.boxes.append(box)
+                            track.tl.keypoints.append(kps)
+                            if fresh:
+                                frontier.add(track)
+                            frame_obs.append((track, box, kps))
+                    with telemetry.timed("stream.score"):
+                        for track, box, kps in frame_obs:
+                            if _clamped_area(box, w, h) <= 0:
+                                continue
+                            others = [(o.uid, ob) for o, ob, _ in frame_obs if o is not track]
+                            score = observation_score(
+                                box, kps, w, h, [ob for _, ob in others], **score_kwargs
+                            )
+                            if score > track.best_score:  # strict: earliest wins ties
+                                track.best_score = score
+                                track.tl.best_frame = frame_idx
+                                track.best_box = box
+                                track.best_others = [(uid, list(ob)) for uid, ob in others]
+                                track.best_crop = crop_snapshot(frame, box, padding).copy()
 
-            # ship eligible
-            while next_ship[0] in frame_buffer:
-                idx = next_ship[0]
-                if frame_blockers.get(idx):
-                    break
-                arr = load_frame(idx)
-                if arr is None:
-                    break
-                # paint
-                for box in render_boxes.get(idx, []):
-                    cv2.rectangle(arr, (box[0], box[1]), (box[2], box[3]), (0, 0, 0), thickness=-1)
-                try:
-                    proc.stdin.write(arr.tobytes())
-                except BrokenPipeError:
-                    break
-                # remove from buffer
-                v = frame_buffer.pop(idx, None)
-                if isinstance(v, Path):
-                    try:
-                        v.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                in_memory_count[0] = max(0, in_memory_count[0] - (0 if isinstance(v, Path) else 1))
-                next_ship[0] += 1
+                for tid, track in list(open_tracks.items()):
+                    if frame_idx - track.last > close_gap:
+                        del open_tracks[tid]
+                        close(track)
+                frontier.advance(frame_idx + 1)
+                if frame_idx % 8 == 0:
+                    report(frame_idx)
 
-    for _ctx in (_track_bar_ctx, _classify_bar_ctx, _ship_bar_ctx):
-        if _ctx is not None:
-            try:
-                _ctx.__exit__(None, None, None)
-            except Exception:
-                pass
+            for track in open_tracks.values():
+                close(track)
+            open_tracks.clear()
+            frontier.finish_tracking()
+            report(max(last_idx, 0))
+            decoder.join()
 
-    # end: close all remaining active
-    for tid in list(active.keys()):
-        close_tracklet(active.pop(tid))
+            if shipper is not None:
+                while shipper.is_alive():
+                    shipper.join(0.5)
+                    report(max(last_idx, 0))
+            if frontier.fatal is not None:
+                raise frontier.fatal
+            decider.drain()
+            report(max(last_idx, 0))
+    except BaseException as error:
+        abort.set()
+        frontier.fail(error)
+        decider.pool.shutdown(wait=False, cancel_futures=True)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise
 
-    if (not defer_render) and (not selective_stream):
-        # ship remaining buffered frames
-        while next_ship[0] < info.frame_count:
-            idx = next_ship[0]
-            if idx in frame_buffer or idx < info.frame_count:
-                if idx in frame_buffer:
-                    arr = load_frame(idx)
-                    if arr is not None:
-                        for box in render_boxes.get(idx, []):
-                            cv2.rectangle(arr, (box[0], box[1]), (box[2], box[3]), (0, 0, 0), thickness=-1)
-                        try:
-                            proc.stdin.write(arr.tobytes())
-                        except BrokenPipeError:
-                            pass
-                        v = frame_buffer.pop(idx, None)
-                        if isinstance(v, Path):
-                            try: v.unlink(missing_ok=True)
-                            except Exception: pass
-            next_ship[0] += 1
+    # Final metadata, numbered exactly as the staged pipeline would.
+    meta = _build_meta(video, info, tracks, cuts if scene_cuts else [], thumbs, scene_cuts)
 
-        try:
-            proc.stdin.close()
-        except Exception:
-            pass
-        if proc is not None:
-            proc.wait()
-
-    # Drain classification queue.
-    for _ in range(max(1, int(classify_workers))):
-        classify_queue.put(None)
-    for _t in _worker_threads:
-        try:
-            _t.join(timeout=300)
-        except Exception:
-            pass
-    try:
-        _finalize_classified()
-    except Exception:
-        pass
-
-    # release any remaining scheduled unblocks
-    for tids in unblock_at.values():
-        for tid in tids:
-            for idx in list(frame_blockers.keys()):
-                if tid in frame_blockers[idx]:
-                    frame_blockers[idx].discard(tid)
-            for gs in list(gop_blockers.keys()):
-                gop_blockers[gs].discard(tid)
-    unblock_at.clear()
-
-    if selective_stream:
-        # ship any remaining GOPs
-        for gstart, gend in gops:
-            if gstart in shipped_gops:
-                continue
-            gop_blockers.get(gstart, set()).clear()
-            frames = gop_frames.pop(gstart, [])
-            edited = any(idx in render_boxes for idx, _ in frames)
-            seg = _Segment(gstart, gend, edited)
-            seg_path = spill_dir / f"gop_{gstart:06d}.ts"
-            if edited:
-                _encode_segment(video, seg_path, render_boxes, keyframes, seg, info, crf, preset, encoder)
-            else:
-                _copy_segment(video, seg_path, keyframes, seg)
-            # Append this GOP to the growing TS file for mid-run playability.
-            with open(growing_ts, "ab") as _f:
-                _f.write(seg_path.read_bytes())
-            try:
-                seg_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            segments.append(seg_path)
-            shipped_gops.add(gstart)
-        # Remux the growing TS into the final MP4 (faststart for playability).
-        import subprocess as _sp
-        _sp.run(
-            ["ffmpeg", "-v", "error", "-y", "-i", str(growing_ts), "-i", str(video),
-             "-map", "0:v:0", "-map", "1:a?", "-c", "copy",
-             "-movflags", "+faststart", str(out)],
-            check=True,
-        )
-        try:
-            growing_ts.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    # build metadata
-    tracklets = []
-    for at in sorted(closed_tracklets, key=lambda a: a.internal_id):
-        t = Tracklet(
-            track_id=at.internal_id,
-            frames=list(at.frames),
-            boxes=[list(b) for b in at.boxes],
-            keypoints=[list(k) for k in at.keypoints],
-            best_frame=best_frame_by_id.get(at.internal_id),
-            best_snapshot_path=snapshot_path_by_id.get(at.internal_id),
-            isolated_track_ids=list(isolated_by_id.get(at.internal_id, [])),
-            redact=redact_by_id.get(at.internal_id),
-            score=score_by_id.get(at.internal_id),
-        )
-        tracklets.append(t)
-    meta = Metadata(video=VideoInfo(path=str(video), fps=fps, width=w, height=h, frames=info.frame_count), tracklets=tracklets)
-    try:
-        save_meta(meta_file, meta)
-    except Exception:
-        pass
-
-    # Orphan recovery + deferred render (selective / orphans) support.
     if orphans:
-        from .track import add_orphan_tracklets
-
-        meta = add_orphan_tracklets(meta, video, on_progress=None)
-        from .snapshot import select_snapshots
-
-        select_snapshots(
-            meta,
-            thumbs_dir=thumbs,
-            padding=padding,
-            isolate=isolate,
-            sub_isolate=sub_isolate,
-            closeup_area_fraction=closeup_area_fraction,
-            head_weight=head_weight,
-            body_weight=body_weight,
-            edge_penalty=edge_penalty,
-            edge_tolerance=edge_tolerance,
-            distractor_weight=distractor_weight,
-            same_person_iou=same_person_iou,
-            isolate_dilate=isolate_dilate,
-            contact_sheet=DEFAULT_CONTACT_SHEET,
-            resume=True,
-            meta_path=meta_file,
+        meta = _finish_with_orphans(
+            meta, video, out, meta_file, thumbs, prompt, clf,
+            dict(
+                padding=padding, isolate=isolate, sub_isolate=sub_isolate,
+                closeup_area_fraction=closeup_area_fraction, head_weight=head_weight,
+                body_weight=body_weight, edge_penalty=edge_penalty,
+                edge_tolerance=edge_tolerance, distractor_weight=distractor_weight,
+                same_person_iou=same_person_iou, isolate_dilate=isolate_dilate,
+                classify_workers=classify_workers, crf=crf, preset=preset,
+                selective=selective, encoder=encoder, max_gap=max_gap,
+                smooth_window=smooth_window, bridge_iou=bridge_iou,
+                min_track_frames=min_track_frames,
+            ),
         )
-        from .classify import classify_snapshots as _classify
+    elif keyframes:
+        parts = [p for _, p in sorted(shipper.parts)]
+        joined = work_dir / "joined.mp4"
+        with telemetry.timed("ship.finalize"):
+            _concat_video(parts, joined)
+            _mux_audio(joined, video, out)
+    shutil.rmtree(work_dir, ignore_errors=True)
 
-        if classifier == "siglip":
-            _classify(meta, prompt, classifier=siglip, resume=True, meta_path=meta_file)
-        else:
-            _classify(
-                meta, prompt, model=model, ollama_url=ollama_url, timeout=timeout,
-                workers=classify_workers, think=think, max_image_size=max_image_size,
-                resume=True, meta_path=meta_file,
-            )
-        try:
-            save_meta(meta_file, meta)
-        except Exception:
-            pass
-
-    if defer_render:
-        from .render import render_redacted
-
-        render_redacted(
-            meta, out, crf=crf, preset=preset, selective=selective, encoder=encoder,
-            max_gap=max_gap, smooth_window=smooth_window, bridge_iou=bridge_iou,
-            min_track_frames=min_track_frames, on_progress=None,
-        )
-
-    # sidecar
-    key = {"prompt": prompt.strip(), "model": model}
-    if classifier == "siglip":
-        key.update(classifier=classifier, threshold=threshold)
-    sidecar.write_text(json.dumps(key) + "\n", encoding="utf-8")
-
-    # contact sheet
-    try:
-        saved = []
-        for at in closed_tracklets:
-            sp = snapshot_path_by_id.get(at.internal_id)
-            if sp and Path(sp).is_file():
-                img = Image.open(sp).convert("RGB")
-                img.thumbnail((192, 256), Image.Resampling.LANCZOS)
-                saved.append((at.internal_id, img))
-        saved.sort(key=lambda x: x[0])
-        if saved:
-            write_contact_sheet(saved, thumbs / DEFAULT_CONTACT_SHEET)
-    except Exception:
-        pass
-
-    # cleanup spill dir
-    try:
-        import shutil
-        shutil.rmtree(spill_dir, ignore_errors=True)
-    except Exception:
-        pass
-    try:
-        ckpt_path.unlink(missing_ok=True)
-    except Exception:
-        pass
+    save_meta(meta_file, meta)
+    sidecar.write_text(json.dumps(_classify_key(prompt, classifier, model, threshold, think)) + "\n", encoding="utf-8")
+    sheet = [(t.track_id, t_thumb) for t, t_thumb in _thumb_pairs(meta, tracks)]
+    if sheet:
+        write_contact_sheet(sorted(sheet, key=lambda p: p[0]), thumbs / DEFAULT_CONTACT_SHEET)
 
     redacted = sum(1 for t in meta.tracklets if t.redact)
     progress(f"{len(meta.tracklets)} tracklet(s), {redacted} redacted; wrote {out}")
     return {"out": out, "meta_path": meta_file, "tracklets": len(meta.tracklets), "redacted": redacted}
+
+
+def _build_meta(video, info, tracks, cuts, thumbs, scene_cuts) -> Metadata:
+    """Renumber like ``build_tracklets`` + ``split_tracklets_at_cuts`` do."""
+    ordered = sorted(tracks, key=lambda t: (t.tracker_id, t.first))
+    next_id = max((t.tracker_id for t in ordered), default=0) + 1
+    splits, seen, renames = 0, set(), {}
+    for t in ordered:
+        if t.tracker_id in seen:
+            new = next_id
+            next_id += 1
+            splits += 1
+        else:
+            seen.add(t.tracker_id)
+            new = t.tracker_id
+        renames[t.uid] = new
+    # Two-phase rename so ids that swap places never overwrite each other.
+    moved = []
+    for t in ordered:
+        src = thumbs / f"track_{t.uid}.jpg"
+        if src.is_file() and renames[t.uid] != t.uid:
+            tmp = src.with_suffix(".tmp")
+            src.rename(tmp)
+            moved.append((tmp, thumbs / f"track_{renames[t.uid]}.jpg"))
+    for tmp, dst in moved:
+        tmp.replace(dst)
+    for t in ordered:
+        tl = t.tl
+        tl.track_id = renames[t.uid]
+        tl.isolated_track_ids = sorted(renames.get(i, i) for i in tl.isolated_track_ids)
+        if tl.best_snapshot_path:
+            tl.best_snapshot_path = str(thumbs / f"track_{tl.track_id}.jpg")
+    meta = Metadata(
+        video=VideoInfo(path=str(video), fps=info.fps, width=info.width, height=info.height, frames=info.frame_count),
+        tracklets=[t.tl for t in ordered],
+    )
+    meta.scene_cuts = list(cuts) if scene_cuts else []
+    meta.scene_cut_splits = splits if scene_cuts else 0
+    return meta
+
+
+def _thumb_pairs(meta, tracks):
+    by_final = {t.tl.track_id: t for t in tracks}
+    for tl in meta.tracklets:
+        t = by_final.get(tl.track_id)
+        if t is not None and t.thumb is not None:
+            yield tl, t.thumb
+
+
+def _finish_with_orphans(meta, video, out, meta_file, thumbs, prompt, clf, opts) -> Metadata:
+    """Orphan recovery needs a full extra pass, so rendering stays staged."""
+    from .classify import classify_snapshots
+    from .snapshot import select_snapshots
+    from .track import add_orphan_tracklets
+
+    meta = add_orphan_tracklets(meta, video, on_progress=None)
+    select_snapshots(
+        meta, thumbs_dir=thumbs, padding=opts["padding"], isolate=opts["isolate"],
+        sub_isolate=opts["sub_isolate"], closeup_area_fraction=opts["closeup_area_fraction"],
+        head_weight=opts["head_weight"], body_weight=opts["body_weight"],
+        edge_penalty=opts["edge_penalty"], edge_tolerance=opts["edge_tolerance"],
+        distractor_weight=opts["distractor_weight"], same_person_iou=opts["same_person_iou"],
+        isolate_dilate=opts["isolate_dilate"], contact_sheet=DEFAULT_CONTACT_SHEET,
+        resume=True, meta_path=meta_file,
+    )
+    classify_snapshots(meta, prompt, classifier=clf, resume=True, meta_path=meta_file,
+                       workers=opts["classify_workers"])
+    render_redacted(
+        meta, out, crf=opts["crf"], preset=opts["preset"], selective=opts["selective"],
+        encoder=opts["encoder"], max_gap=opts["max_gap"], smooth_window=opts["smooth_window"],
+        bridge_iou=opts["bridge_iou"], min_track_frames=opts["min_track_frames"],
+    )
+    return meta
