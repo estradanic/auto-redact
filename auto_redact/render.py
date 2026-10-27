@@ -40,8 +40,10 @@ space and would misalign silently.
 
 from __future__ import annotations
 
+import logging
 import math
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from fractions import Fraction
@@ -55,6 +57,8 @@ from .frames import VideoInfo, iter_frames, probe_video
 from .meta import Metadata
 
 DEFAULT_CRF = 18
+logger = logging.getLogger(__name__)
+
 DEFAULT_PRESET = "medium"
 DEFAULT_ENCODER = "libx264"
 ENCODERS = ("libx264", "h264_nvenc")
@@ -338,11 +342,45 @@ def render_redacted(
     )
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    if selective:
-        _render_selective(source, out, boxes, probe, crf, preset, encoder, on_progress)
-    else:
-        _encode(source, out, boxes, probe, crf, preset, encoder, on_progress)
+    if encoder == "h264_nvenc":
+        release_gpu_memory()
+
+    def run(encoder: str, preset: str) -> None:
+        if selective:
+            _render_selective(source, out, boxes, probe, crf, preset, encoder, on_progress)
+        else:
+            _encode(source, out, boxes, probe, crf, preset, encoder, on_progress)
+
+    try:
+        run(encoder, preset)
+    except RenderError as error:
+        if encoder != "h264_nvenc":
+            raise
+        fallback_preset = nvenc_fallback_preset(preset, error)
+        run("libx264", fallback_preset)
     return out
+
+
+def release_gpu_memory() -> None:
+    """Free cached CUDA memory so NVENC can create its own context."""
+    import gc
+
+    gc.collect()
+    torch = sys.modules.get("torch")
+    try:
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def nvenc_fallback_preset(preset: str, error: BaseException) -> str:
+    """Log the NVENC failure and return a libx264 preset to retry with."""
+    logger.warning(
+        "h264_nvenc failed (%s); falling back to libx264. On small GPUs NVENC "
+        "needs free VRAM for its own CUDA context.", str(error).splitlines()[0][:200],
+    )
+    return DEFAULT_PRESET if preset in _NVENC_PRESETS.values() else preset
 
 
 def _clamp_box(box: list[float], width: int, height: int) -> PixelBox | None:
@@ -637,6 +675,11 @@ def _copy_segment(
         stream = input_container.streams.video[0]
         with av.open(str(part), "w") as output_container:
             output_stream = output_container.add_stream_from_template(stream)
+            try:
+                # Jump to the keyframe at ``low`` instead of demuxing from the start.
+                input_container.seek(low, stream=stream, backward=True, any_frame=False)
+            except Exception:
+                pass
             for packet in input_container.demux(stream):
                 if packet.pts is None:
                     continue
