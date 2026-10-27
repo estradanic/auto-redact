@@ -39,45 +39,31 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Any, Callable
+from typing import Callable
 from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-import os
-
 from .frames import iter_frames
-from .meta import Metadata, Tracklet, save_meta, save_meta_fast
-from .track import _resolve_meta_path
-from . import track as _track_mod
+from .config import SnapshotConfig, resolve
+from .geometry import box_iou, clamp01, clamped_area, overlap_fraction
+from .meta import Metadata, Tracklet, save_meta
+from .detectors import make_detector
+from .protocols import PersonDetector
 
-
-def _load_yolo(device=None):
-    """Delegate to the cached loader in :mod:`auto_redact.track`."""
-    return _track_mod._load_yolo(device)
 
 DEFAULT_THUMBS_DIR = "thumbs"
-DEFAULT_CONTACT_SHEET = "contact_sheet.jpg"
-DEFAULT_PADDING = 0.2  # extra margin around the bbox, per side, as a fraction
 JPEG_QUALITY = 90
 
 HEAD_KEYPOINTS = 5  # COCO order: nose, left/right eye, left/right ear
-HEAD_WEIGHT = 0.5  # share of the score that depends on head visibility
 BODY_KEYPOINTS = slice(11, 17)  # COCO: hips, knees, ankles
-BODY_WEIGHT = 0.5  # share of the score that depends on lower-body visibility
-EDGE_PENALTY = 0.85  # score multiplier per frame edge the box touches
-EDGE_TOLERANCE = 1.0  # px
 
-SAME_PERSON_IOU = 0.5  # bbox IoU >= this: probably the subject, not a bystander
 # When the subject's bbox covers at least this fraction of the frame, treat
 # the observation as a close-up: blacking out bystanders (tracklet or
 # sub-isolation) paints large bars that confuse the classifier, and the
 # subject already dominates the crop, so isolation is skipped.
-CLOSEUP_AREA_FRACTION = 0.35
-DISTRACTOR_WEIGHT = 0.5  # max share of the score removed by bystanders in the crop
-ISOLATE_DILATE = 0.1  # painted bystander boxes grow per side, fraction of their size
 
 CONTACT_SHEET_CELL = (192, 256)  # per-thumbnail cell, max (width, height) px
 CONTACT_SHEET_LABEL_HEIGHT = 24  # px reserved below each cell for "track <id>"
@@ -95,13 +81,13 @@ def best_observation(
     others: Sequence[Tracklet] = (),
     frame_boxes: dict[int, list[tuple[int, list[float]]]] | None = None,
     *,
-    padding: float = DEFAULT_PADDING,
-    head_weight: float = HEAD_WEIGHT,
-    body_weight: float = BODY_WEIGHT,
-    edge_penalty: float = EDGE_PENALTY,
-    edge_tolerance: float = EDGE_TOLERANCE,
-    distractor_weight: float = DISTRACTOR_WEIGHT,
-    same_person_iou: float = SAME_PERSON_IOU,
+    padding: float = SnapshotConfig.padding,
+    head_weight: float = SnapshotConfig.head_weight,
+    body_weight: float = SnapshotConfig.body_weight,
+    edge_penalty: float = SnapshotConfig.edge_penalty,
+    edge_tolerance: float = SnapshotConfig.edge_tolerance,
+    distractor_weight: float = SnapshotConfig.distractor_weight,
+    same_person_iou: float = SnapshotConfig.same_person_iou,
 ) -> tuple[int, list[float]]:
     """Pick the tracklet's best observation: ``(frame index, box)``.
 
@@ -142,7 +128,7 @@ def best_observation(
     best_score = -1.0
     any_area = False
     for i, box in enumerate(tracklet.boxes):
-        if _clamped_area(box, width, height) <= 0:
+        if clamped_area(box, width, height) <= 0:
             continue
         any_area = True
         keypoints = tracklet.keypoints[i] if tracklet.keypoints else []
@@ -194,13 +180,13 @@ def observation_score(
     height: int,
     other_boxes: Sequence[Sequence[float]] = (),
     *,
-    padding: float = DEFAULT_PADDING,
-    head_weight: float = HEAD_WEIGHT,
-    body_weight: float = BODY_WEIGHT,
-    edge_penalty: float = EDGE_PENALTY,
-    edge_tolerance: float = EDGE_TOLERANCE,
-    distractor_weight: float = DISTRACTOR_WEIGHT,
-    same_person_iou: float = SAME_PERSON_IOU,
+    padding: float = SnapshotConfig.padding,
+    head_weight: float = SnapshotConfig.head_weight,
+    body_weight: float = SnapshotConfig.body_weight,
+    edge_penalty: float = SnapshotConfig.edge_penalty,
+    edge_tolerance: float = SnapshotConfig.edge_tolerance,
+    distractor_weight: float = SnapshotConfig.distractor_weight,
+    same_person_iou: float = SnapshotConfig.same_person_iou,
 ) -> float:
     """Score one observation: higher means a better snapshot candidate.
 
@@ -228,14 +214,14 @@ def observation_score(
       ``box`` (``SAME_PERSON_IOU``) count as the subject, not
       bystanders.
     """
-    area = _clamped_area(box, width, height)
+    area = clamped_area(box, width, height)
     if area <= 0:
         return 0.0
     visibility = 1.0
     head = 1.0
     body = 1.0
     if keypoints:
-        confs = [_clamp01(kp[2]) for kp in keypoints]
+        confs = [clamp01(kp[2]) for kp in keypoints]
         visibility = sum(confs) / len(confs)
         head_confs = confs[:HEAD_KEYPOINTS]
         head = 1.0 - head_weight * (1.0 - sum(head_confs) / len(head_confs))
@@ -251,7 +237,7 @@ def observation_score(
         )
     )
     occlusion = max(
-        (_overlap_fraction(box, other, width, height) for other in other_boxes),
+        (overlap_fraction(box, other, width, height) for other in other_boxes),
         default=0.0,
     )
     distractor = (
@@ -295,8 +281,8 @@ def redact_others(
     target_box: Sequence[float],
     others: Sequence[tuple[int, Sequence[float]]],
     *,
-    dilate: float = ISOLATE_DILATE,
-    same_person_iou: float = SAME_PERSON_IOU,
+    dilate: float = SnapshotConfig.isolate_dilate,
+    same_person_iou: float = SnapshotConfig.same_person_iou,
 ) -> tuple[np.ndarray, list[int]]:
     """Black out every bystander inside ``crop`` (painted in place).
 
@@ -327,7 +313,7 @@ def redact_others(
     # subject (high IoU) are skipped entirely, as before.
     mask = np.zeros((height, width), dtype=bool)
     for track_id, box in others:
-        if _box_iou(box, target_box) >= same_person_iou:
+        if box_iou(box, target_box) >= same_person_iou:
             continue
         x1, y1, x2, y2 = (float(v) for v in box)
         pad_x = max(2.0, (x2 - x1) * dilate)
@@ -356,14 +342,14 @@ def sub_isolate_people(
     crop: np.ndarray,
     window: tuple[int, int, int, int],
     target_box: Sequence[float],
-    model: Any,
+    detector: PersonDetector | None,
     *,
-    dilate: float = ISOLATE_DILATE,
+    dilate: float = SnapshotConfig.isolate_dilate,
     conf: float = 0.25,
 ) -> int:
     """Black out extra people detected inside ``crop`` (beyond the subject).
 
-    Runs a person detector (``model``) on the already-cropped thumbnail and,
+    Runs a person detector (``detector``) on the already-cropped thumbnail and,
     when more than one person is found, keeps the detection that best overlaps
     the subject's box and paints the others solid black. This recovers cases
     where the original tracker merged two people into a single tracklet, so
@@ -371,29 +357,12 @@ def sub_isolate_people(
     people painted (0 when the detector finds at most one person or is
     unavailable).
     """
-    if model is None:
+    if detector is None:
         return 0
     try:
-        results = model(crop, verbose=False)
+        boxes = detector.detect(crop, conf)
     except Exception:
         return 0
-    boxes: list[list[float]] = []
-    for result in results:
-        if getattr(result, "boxes", None) is None:
-            continue
-        try:
-            xyxy = result.boxes.xyxy.cpu().numpy()
-            confs = result.boxes.conf.cpu().numpy()
-        except Exception:
-            try:
-                xyxy = np.asarray(result.boxes.xyxy)
-                confs = np.asarray(result.boxes.conf)
-            except Exception:
-                continue
-        for i in range(len(xyxy)):
-            if i < len(confs) and float(confs[i]) < conf:
-                continue
-            boxes.append([float(v) for v in xyxy[i]])
     if len(boxes) <= 1:
         return 0
 
@@ -405,7 +374,7 @@ def sub_isolate_people(
         float(target_box[2]) - wx1,
         float(target_box[3]) - wy1,
     ]
-    best_idx = max(range(len(boxes)), key=lambda i: _box_iou(boxes[i], target_crop))
+    best_idx = max(range(len(boxes)), key=lambda i: box_iou(boxes[i], target_crop))
 
     mask = np.zeros((height, width), dtype=bool)
     painted = 0
@@ -434,39 +403,16 @@ def sub_isolate_people(
     return painted
 
 
-    crop[mask] = 0
-    return crop, sorted(painted)
-
-
 def select_snapshots(
     meta: Metadata,
     thumbs_dir: str | Path = DEFAULT_THUMBS_DIR,
+    config: SnapshotConfig | None = None,
     *,
-    padding: float = DEFAULT_PADDING,
-    isolate: bool = True,
-    sub_isolate: bool = False,
-    closeup_area_fraction: float = CLOSEUP_AREA_FRACTION,
-    head_weight: float = HEAD_WEIGHT,
-    body_weight: float = BODY_WEIGHT,
-    edge_penalty: float = EDGE_PENALTY,
-    edge_tolerance: float = EDGE_TOLERANCE,
-    distractor_weight: float = DISTRACTOR_WEIGHT,
-    same_person_iou: float = SAME_PERSON_IOU,
-    isolate_dilate: float = ISOLATE_DILATE,
-    contact_sheet: str | Path | None = DEFAULT_CONTACT_SHEET,
     on_progress: Callable[[int, int], None] | None = None,
     resume: bool = True,
-    meta_path=None,
-    save_path=None,
-    checkpoint_path=None,
-    checkpoint=None,
-    output=None,
-    out=None,
-    path=None,
-    file=None,
-    destination=None,
-    dest=None,
-    **kwargs,
+    meta_path: str | Path | None = None,
+    detector: PersonDetector | None = None,
+    **overrides,
 ) -> Metadata:
     """Give every tracklet its best-frame thumbnail and record it in ``meta``.
 
@@ -482,14 +428,14 @@ def select_snapshots(
     Args:
         meta: Tracklet metadata whose ``video.path`` is read as the source.
         thumbs_dir: Directory for the thumbnails (created if missing).
-        padding: Crop margin around each bbox, per side, as a fraction of
-            the bbox size (must be a finite number >= 0).
-        isolate: Black out bystanders in each thumbnail so the classifier
-            can only judge the tracklet's own subject; their track ids
-            land in ``Tracklet.isolated_track_ids``. ``False`` keeps the
-            raw crop.
-        contact_sheet: Contact sheet filename; a relative path resolves
-            inside ``thumbs_dir``. ``None`` skips the contact sheet.
+        config: A :class:`~auto_redact.config.SnapshotConfig`; keyword
+            ``overrides`` are applied on top. ``padding`` (finite, >= 0)
+            is the crop margin per side as a fraction of the bbox size;
+            ``isolate`` blacks out bystanders so the classifier can only
+            judge the tracklet's own subject (their track ids land in
+            ``Tracklet.isolated_track_ids``); ``contact_sheet`` is a
+            filename resolved inside ``thumbs_dir`` (``None`` skips it).
+        meta_path: Where the metadata lives; enables checkpointing.
         on_progress: Optional ``(done, total)`` callback, in decoded frames
             (the scan stops once the last needed frame is reached).
 
@@ -498,30 +444,15 @@ def select_snapshots(
         SnapshotError: invalid padding, a tracklet without observations
             or usable boxes, or a needed frame absent from the video.
     """
+    cfg = resolve(SnapshotConfig, config, overrides)
+    padding, isolate, sub_isolate = cfg.padding, cfg.isolate, cfg.sub_isolate
+    closeup_area_fraction, same_person_iou = cfg.closeup_area_fraction, cfg.same_person_iou
+    isolate_dilate, contact_sheet = cfg.isolate_dilate, cfg.contact_sheet
+    head_weight, body_weight = cfg.head_weight, cfg.body_weight
+    edge_penalty, edge_tolerance = cfg.edge_penalty, cfg.edge_tolerance
+    distractor_weight = cfg.distractor_weight
     _check_padding(padding)
-    # Collect any extra path-like keyword.
-    for key, value in list(kwargs.items()):
-        if value is None:
-            continue
-        low = key.lower()
-        if isinstance(value, (str, Path, os.PathLike)) and (
-            "meta" in low or "path" in low or "out" in low
-            or "dest" in low or "save" in low or "checkpoint" in low
-        ):
-            if meta_path is None and save_path is None and checkpoint_path is None and output is None and out is None and path is None:
-                meta_path = value
-    target = _resolve_meta_path(
-        meta_path=meta_path,
-        save_path=save_path,
-        checkpoint_path=checkpoint_path,
-        checkpoint=checkpoint,
-        output=output,
-        out=out,
-        path=path,
-        file=file,
-        destination=destination,
-        dest=dest,
-    )
+    target = Path(meta_path) if meta_path is not None else None
 
     if not resume:
         for tracklet in meta.tracklets:
@@ -587,10 +518,10 @@ def select_snapshots(
     # Optional second-stage detector for merged tracklets (see
     # :func:`sub_isolate_people`). Loaded lazily so the dependency is only
     # needed when the feature is requested.
-    sub_model = None
-    if sub_isolate:
+    sub_model = detector
+    if sub_isolate and sub_model is None:
         try:
-            sub_model = _load_yolo("cpu")
+            sub_model = make_detector("cpu")
         except Exception:
             sub_model = None
 
@@ -619,7 +550,7 @@ def select_snapshots(
                     # large black bars that confuse the classifier, and the
                     # subject already dominates the crop, so skip isolation
                     # (and sub-isolation) for them.
-                    _area_fraction = _clamped_area(box, width, height) / max(
+                    _area_fraction = clamped_area(box, width, height) / max(
                         1.0, float(width) * float(height)
                     )
                     _closeup = _area_fraction >= closeup_area_fraction
@@ -812,7 +743,7 @@ def _distractor_fraction(
     width: int,
     height: int,
     padding: float,
-    same_person_iou: float = SAME_PERSON_IOU,
+    same_person_iou: float = SnapshotConfig.same_person_iou,
 ) -> float:
     """Share of the padded crop window of ``box`` intruded on by others.
 
@@ -830,59 +761,15 @@ def _distractor_fraction(
         return 0.0
     covered = 0.0
     for other in other_boxes:
-        if _box_iou(coords, other) >= same_person_iou:
+        if box_iou(coords, other) >= same_person_iou:
             continue
-        covered += _clamped_area(
+        covered += clamped_area(
             [max(window[0], other[0]), max(window[1], other[1]),
              min(window[2], other[2]), min(window[3], other[3])],
             width,
             height,
         )
     return min(1.0, covered / window_area)
-
-
-def _box_iou(a: Sequence[float], b: Sequence[float]) -> float:
-    """Intersection-over-union of two boxes (0 when either is empty)."""
-    inter_w = max(0.0, min(float(a[2]), float(b[2])) - max(float(a[0]), float(b[0])))
-    inter_h = max(0.0, min(float(a[3]), float(b[3])) - max(float(a[1]), float(b[1])))
-    inter = inter_w * inter_h
-    union = (
-        max(0.0, float(a[2]) - float(a[0])) * max(0.0, float(a[3]) - float(a[1]))
-        + max(0.0, float(b[2]) - float(b[0])) * max(0.0, float(b[3]) - float(b[1]))
-        - inter
-    )
-    return inter / union if union > 0 else 0.0
-
-
-def _clamped_area(box: list[float], width: int, height: int) -> float:
-    """Visible area of ``box`` after clamping it to the frame, in px²."""
-    x1, y1, x2, y2 = (float(v) for v in box)
-    x1 = max(0.0, min(float(width), x1))
-    y1 = max(0.0, min(float(height), y1))
-    x2 = max(0.0, min(float(width), x2))
-    y2 = max(0.0, min(float(height), y2))
-    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
-
-
-def _clamp01(value: float) -> float:
-    value = float(value)
-    return min(1.0, max(0.0, value)) if math.isfinite(value) else 0.0
-
-
-def _overlap_fraction(
-    box: Sequence[float], other: Sequence[float], width: int, height: int
-) -> float:
-    """Fraction of ``box``'s visible area covered by ``other``."""
-    own = _clamped_area(list(box), width, height)
-    if own <= 0:
-        return 0.0
-    inter = _clamped_area(
-        [max(box[0], other[0]), max(box[1], other[1]),
-         min(box[2], other[2]), min(box[3], other[3])],
-        width,
-        height,
-    )
-    return min(1.0, inter / own)
 
 
 def _check_padding(padding: float) -> None:

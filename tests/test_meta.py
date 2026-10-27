@@ -1,10 +1,10 @@
-"""Tests for metadata schema v1: save/load round-trip and validation (#11)."""
+"""Tests for the metadata schema: save/load round-trip, legacy v1, validation (#11)."""
 
 import json
-import tempfile
-import unittest
-from dataclasses import fields
 from pathlib import Path
+
+import numpy as np
+import pytest
 
 from auto_redact.meta import (
     SCHEMA_VERSION,
@@ -13,6 +13,7 @@ from auto_redact.meta import (
     Tracklet,
     VideoInfo,
     load_meta,
+    meta_from_document,
     save_meta,
 )
 
@@ -35,7 +36,6 @@ def sample_metadata():
         keypoints=[pose_frame(0.0), pose_frame(0.5), pose_frame(1.0)],
         best_frame=13,
         best_snapshot_path="thumbs/track_1.jpg",
-        redact=None,
     )
     track2 = Tracklet(  # snapshot/classification fields still null
         track_id=2,
@@ -47,10 +47,10 @@ def sample_metadata():
     return Metadata(video=video, tracklets=[track1, track2])
 
 
-def valid_document():
-    """A minimal schema v1 document, as raw JSON data."""
+def legacy_document():
+    """A minimal schema v1 document: everything inline in one JSON file."""
     return {
-        "version": SCHEMA_VERSION,
+        "version": 1,
         "video": {"path": "clip.mp4", "fps": 30, "width": 1280, "height": 720, "frames": 900},
         "tracklets": [
             {
@@ -63,301 +63,358 @@ def valid_document():
     }
 
 
-class RoundTripTests(unittest.TestCase):
-    """The issue #11 acceptance bar: save, load, get identical data back."""
+def load_document(doc):
+    return meta_from_document(doc)
 
-    def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.dir = Path(tmp.name)
 
-    def test_save_then_load_returns_identical_data(self):
-        meta = sample_metadata()
-        path = self.dir / "out.json"
+# --- round trip -----------------------------------------------------------------
+
+
+def test_save_then_load_returns_identical_data(tmp_path):
+    meta = sample_metadata()
+    path = tmp_path / "out.json"
+    save_meta(path, meta)
+    loaded = load_meta(path)
+    assert loaded == meta
+    save_meta(path, loaded)  # and again, unchanged
+    assert load_meta(path) == loaded
+
+
+def test_summary_json_is_small_and_arrays_live_in_the_npz(tmp_path):
+    path = save_meta(tmp_path / "out.meta.json", sample_metadata())
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    assert data["version"] == SCHEMA_VERSION
+    assert data["arrays"] == "out.meta.npz"
+    assert set(data) == {
+        "version", "video", "tracklets", "scene_cuts", "scene_cut_splits", "arrays"
+    }
+    assert set(data["video"]) == {"path", "fps", "width", "height", "frames"}
+    track = data["tracklets"][0]
+    assert set(track) == {
+        "track_id", "observations", "best_frame", "best_snapshot_path",
+        "isolated_track_ids", "redact", "score", "detail", "override",
+    }
+    assert track["observations"] == 3
+    assert track["redact"] is None  # classification (#13) fills this in
+
+    with np.load(tmp_path / "out.meta.npz") as arrays:
+        assert arrays["t1_frames"].shape == (3,)
+        assert arrays["t1_boxes"].shape == (3, 4)
+        assert arrays["t1_keypoints"].shape == (3, 17, 3)
+
+
+def test_classification_and_snapshot_fields_round_trip(tmp_path):
+    meta = sample_metadata()
+    meta.tracklets[0].redact = True
+    meta.tracklets[0].score = 0.75
+    meta.tracklets[0].isolated_track_ids = [2, 5]
+    meta.tracklets[1].redact = False
+    meta.scene_cuts = [40, 90]
+    meta.scene_cut_splits = 1
+    loaded = load_meta(save_meta(tmp_path / "out.json", meta))
+    assert loaded == meta
+    assert loaded.tracklets[0].redact is True
+    assert loaded.tracklets[1].redact is False
+    assert loaded.tracklets[1].score is None
+    assert loaded.tracklets[1].isolated_track_ids == []
+
+
+def test_detail_and_override_round_trip_and_override_wins(tmp_path):
+    meta = sample_metadata()
+    meta.tracklets[0].redact = False
+    meta.tracklets[0].detail = "reply: 'No.'"
+    meta.tracklets[0].override = True
+    loaded = load_meta(save_meta(tmp_path / "out.json", meta))
+    assert loaded == meta
+    assert loaded.tracklets[0].effective_redact is True  # human beats classifier
+    assert loaded.tracklets[1].effective_redact is None  # neither set
+    loaded.tracklets[0].override = None
+    assert loaded.tracklets[0].effective_redact is False
+
+
+def test_hand_edited_redact_flag_is_honoured(tmp_path):
+    path = save_meta(tmp_path / "out.json", sample_metadata())
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["tracklets"][1]["redact"] = True
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert load_meta(path).tracklets[1].redact is True
+
+
+def test_save_creates_parent_directories(tmp_path):
+    path = tmp_path / "nested" / "thumbs" / "meta.json"
+    save_meta(path, sample_metadata())
+    assert path.is_file() and path.with_suffix(".npz").is_file()
+
+
+def test_numpy_values_from_detection_are_accepted(tmp_path):
+    meta = Metadata(
+        video=VideoInfo("clip.mp4", np.float64(30.0), np.int64(1280), 720, 2),
+        tracklets=[
+            Tracklet(
+                track_id=np.int64(1),
+                frames=np.array([0, 1]),
+                boxes=np.array([[0.0, 0.0, 10.0, 10.0], [1.0, 1.0, 11.0, 11.0]]),
+                keypoints=np.array([pose_frame(), pose_frame()]),
+            )
+        ],
+    )
+    loaded = load_meta(save_meta(tmp_path / "out.json", meta))
+    assert loaded.tracklets[0].frames == [0, 1]
+    assert loaded.tracklets[0].boxes[1] == [1.0, 1.0, 11.0, 11.0]
+    assert loaded.video.width == 1280
+
+
+def test_tracklets_without_keypoints_round_trip(tmp_path):
+    meta = Metadata(
+        video=VideoInfo("clip.mp4", 30.0, 1280, 720, 2),
+        tracklets=[Tracklet(1, [0, 1], [[0.0, 0.0, 5.0, 5.0]] * 2, [[], []])],
+    )
+    assert load_meta(save_meta(tmp_path / "out.json", meta)) == meta
+
+
+def test_empty_metadata_round_trips(tmp_path):
+    meta = Metadata(video=VideoInfo("clip.mp4", 30.0, 640, 480, 1))
+    assert load_meta(save_meta(tmp_path / "out.json", meta)) == meta
+
+
+def test_video_info_from_probe_converts_the_frames_probe():
+    class Probe:  # duck-typed stand-in for frames.VideoInfo
+        path = Path("clip.mp4")
+        fps = 30.0
+        width = 1280
+        height = 720
+        frame_count = 900
+
+    assert VideoInfo.from_probe(Probe()) == VideoInfo("clip.mp4", 30.0, 1280, 720, 900)
+
+
+def test_video_info_from_probe_rejects_non_probe_objects():
+    with pytest.raises(MetaError, match=r"missing attribute\(s\)"):
+        VideoInfo.from_probe(object())
+
+
+# --- legacy schema v1 -------------------------------------------------------------
+
+
+def test_legacy_v1_documents_still_load(tmp_path):
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps(legacy_document()), encoding="utf-8")
+    loaded = load_meta(path)
+    assert loaded.video.fps == 30
+    assert loaded.tracklets[0].boxes == [[0.0, 0.0, 10.0, 10.0]]
+    assert loaded.tracklets[0].redact is None
+    assert loaded.tracklets[0].isolated_track_ids == []
+    # saving upgrades it to the current layout
+    save_meta(path, loaded)
+    assert json.loads(path.read_text())["version"] == SCHEMA_VERSION
+    assert load_meta(path) == loaded
+
+
+# --- validation ---------------------------------------------------------------------
+
+
+def assert_load_fails(doc, message):
+    with pytest.raises(MetaError, match=message):
+        load_document(doc)
+
+
+def test_unsupported_version_is_rejected():
+    doc = legacy_document()
+    doc["version"] = SCHEMA_VERSION + 1
+    assert_load_fails(doc, rf"unsupported schema version {SCHEMA_VERSION + 1}")
+
+
+def test_missing_version_is_rejected():
+    doc = legacy_document()
+    del doc["version"]
+    assert_load_fails(doc, r"missing key\(s\): version")
+
+
+def test_unknown_keys_are_rejected():
+    doc = legacy_document()
+    doc["trackletz"] = []
+    assert_load_fails(doc, "trackletz")
+
+
+def test_non_object_document_is_rejected():
+    assert_load_fails([1, 2, 3], r"expected object, got list")
+
+
+def test_wrong_version_type_is_rejected():
+    doc = legacy_document()
+    doc["version"] = True
+    assert_load_fails(doc, r"version: expected integer, got bool")
+
+
+def test_misaligned_tracklet_is_rejected():
+    doc = legacy_document()
+    doc["tracklets"][0]["frames"] = [0, 1]
+    assert_load_fails(doc, r"frames, boxes and keypoints must be aligned")
+
+
+def test_wrong_box_arity_is_rejected():
+    doc = legacy_document()
+    doc["tracklets"][0]["boxes"] = [[0.0, 0.0, 10.0]]
+    assert_load_fails(doc, r"expected 4 coordinates \[x1, y1, x2, y2\]")
+
+
+def test_wrong_keypoint_shape_is_rejected():
+    doc = legacy_document()
+    doc["tracklets"][0]["keypoints"] = [[[1.0, 2.0]]]
+    assert_load_fails(doc, r"expected \[x, y, confidence\]")
+
+
+def test_uneven_keypoint_counts_are_rejected():
+    doc = legacy_document()
+    track = doc["tracklets"][0]
+    track["frames"] = [0, 1]
+    track["boxes"] = [[0.0, 0.0, 10.0, 10.0]] * 2
+    track["keypoints"] = [pose_frame(0.0), pose_frame(0.0, 16)]
+    assert_load_fails(doc, r"keypoints per frame must match")
+
+
+def test_negative_frame_index_is_rejected():
+    doc = legacy_document()
+    doc["tracklets"][0]["frames"] = [-1]
+    assert_load_fails(doc, r"non-negative integer")
+
+
+def test_fractional_frame_index_is_rejected():
+    doc = legacy_document()
+    doc["tracklets"][0]["frames"] = [0.5]
+    assert_load_fails(doc, r"list of integers")
+
+
+def test_non_finite_coordinates_are_rejected(tmp_path):
+    meta = sample_metadata()
+    meta.tracklets[0].boxes[0][0] = float("nan")
+    with pytest.raises(MetaError, match="finite"):
+        save_meta(tmp_path / "out.json", meta)
+
+
+def test_wrong_video_fps_type_is_rejected():
+    doc = legacy_document()
+    doc["video"]["fps"] = "30"
+    assert_load_fails(doc, r"fps")
+
+
+def test_non_positive_video_fps_is_rejected():
+    doc = legacy_document()
+    doc["video"]["fps"] = -30
+    assert_load_fails(doc, r"fps")
+
+
+def test_non_boolean_redact_is_rejected():
+    doc = legacy_document()
+    doc["tracklets"][0]["redact"] = "yes"
+    assert_load_fails(doc, r"redact")
+
+
+def test_non_array_tracklets_is_rejected():
+    doc = legacy_document()
+    doc["tracklets"] = {}
+    assert_load_fails(doc, r"tracklets")
+
+
+def test_save_refuses_to_write_an_invalid_document(tmp_path):
+    meta = Metadata(
+        video=VideoInfo("clip.mp4", 30.0, 1280, 720, 900),
+        tracklets=[
+            Tracklet(
+                track_id=1,
+                frames=[0, 1],
+                boxes=[[0.0, 0.0, 10.0, 10.0]],
+                keypoints=[pose_frame()],
+            )
+        ],
+    )
+    path = tmp_path / "out.json"
+    with pytest.raises(MetaError, match="must be aligned"):
         save_meta(path, meta)
-        loaded = load_meta(path)
-        self.assertEqual(loaded, meta)
-        # ... and loading what was loaded again changes nothing either
-        again = self.dir / "out.json"
-        save_meta(again, loaded)
-        self.assertEqual(load_meta(again), loaded)
-
-    def test_saved_document_matches_schema_shape(self):
-        path = save_meta(self.dir / "out.json", sample_metadata())
-        data = json.loads(path.read_text(encoding="utf-8"))
-
-        self.assertEqual(data["version"], SCHEMA_VERSION)
-        self.assertEqual(set(data), {"version", "video", "tracklets"})
-        self.assertEqual(
-            set(data["video"]), {"path", "fps", "width", "height", "frames"}
-        )
-
-        track = data["tracklets"][0]
-        self.assertEqual(
-            set(track),
-            {
-                "track_id",
-                "frames",
-                "boxes",
-                "keypoints",
-                "best_frame",
-                "best_snapshot_path",
-                "isolated_track_ids",
-                "redact",
-                "score",
-            },
-        )
-        self.assertIsNone(track["redact"])  # classification (#13) fills this in
-        self.assertEqual(len(track["frames"]), len(track["boxes"]))
-        self.assertEqual(len(track["frames"]), len(track["keypoints"]))
-        self.assertEqual(len(track["keypoints"][0]), 17)
-        self.assertEqual(len(track["keypoints"][0][0]), 3)
-
-    def test_score_round_trips(self):
-        meta = sample_metadata()
-        meta.tracklets[0].score = 0.75
-        loaded = Metadata.from_dict(meta.to_dict())
-        self.assertEqual(loaded.tracklets[0].score, 0.75)
-        self.assertIsNone(loaded.tracklets[1].score)
-
-    def test_redact_round_trips_once_classification_fills_it(self):
-        meta = sample_metadata()
-        meta.tracklets[0].redact = True
-        meta.tracklets[1].redact = False
-        path = self.dir / "out.json"
-        save_meta(path, meta)
-        loaded = load_meta(path)
-        self.assertIs(loaded.tracklets[0].redact, True)
-        self.assertIs(loaded.tracklets[1].redact, False)
-
-    def test_isolated_track_ids_round_trip(self):
-        meta = sample_metadata()
-        meta.tracklets[0].isolated_track_ids = [2, 5]
-        path = self.dir / "out.json"
-        save_meta(path, meta)
-        loaded = load_meta(path)
-        self.assertEqual(loaded.tracklets[0].isolated_track_ids, [2, 5])
-        self.assertEqual(loaded.tracklets[1].isolated_track_ids, [])
-
-    def test_missing_optional_fields_load_as_null(self):
-        # A tracking-only pass may omit fields #12/#13 fill in later.
-        doc = valid_document()
-        meta = Metadata.from_dict(doc)
-        track = meta.tracklets[0]
-        self.assertIsNone(track.best_frame)
-        self.assertIsNone(track.best_snapshot_path)
-        self.assertIsNone(track.redact)
-        self.assertEqual(track.isolated_track_ids, [])  # nobody painted out
-
-        # Saving adds them back as null, so the file shape is stable.
-        path = save_meta(self.dir / "out.json", meta)
-        saved = json.loads(path.read_text(encoding="utf-8"))
-        self.assertIsNone(saved["tracklets"][0]["best_frame"])
-        self.assertIsNone(saved["tracklets"][0]["best_snapshot_path"])
-        self.assertEqual(saved["tracklets"][0]["isolated_track_ids"], [])
-        self.assertIsNone(saved["tracklets"][0]["redact"])
-
-    def test_save_creates_parent_directories(self):
-        path = self.dir / "nested" / "thumbs" / "meta.json"
-        save_meta(path, sample_metadata())
-        self.assertTrue(path.is_file())
-
-    def test_array_like_values_from_detection_are_accepted(self):
-        # Tracking (#10) may hand over numpy/torch arrays, not lists.
-        class ArrayLike:
-            def __init__(self, data):
-                self._data = data
-
-            def tolist(self):
-                return self._data
-
-        meta = Metadata(
-            video=VideoInfo("clip.mp4", 30.0, 1280, 720, 2),
-            tracklets=[
-                Tracklet(
-                    track_id=1,
-                    frames=ArrayLike([0, 1]),
-                    boxes=ArrayLike(
-                        [[0.0, 0.0, 10.0, 10.0], [1.0, 1.0, 11.0, 11.0]]
-                    ),
-                    keypoints=[pose_frame(), pose_frame()],
-                )
-            ],
-        )
-        path = save_meta(self.dir / "out.json", meta)
-        expected = Metadata(
-            video=VideoInfo("clip.mp4", 30.0, 1280, 720, 2),
-            tracklets=[
-                Tracklet(
-                    track_id=1,
-                    frames=[0, 1],
-                    boxes=[[0.0, 0.0, 10.0, 10.0], [1.0, 1.0, 11.0, 11.0]],
-                    keypoints=[pose_frame(), pose_frame()],
-                )
-            ],
-        )
-        self.assertEqual(load_meta(path), expected)
-
-    def test_video_info_from_probe_converts_the_frames_probe(self):
-        # Bridge from #8: probe_video() -> metadata document video info.
-        class Probe:  # duck-typed stand-in for frames.VideoInfo
-            path = Path("clip.mp4")
-            fps = 30.0
-            width = 1280
-            height = 720
-            frame_count = 900
-            duration = 30.0
-
-        info = VideoInfo.from_probe(Probe())
-        self.assertEqual(info, VideoInfo("clip.mp4", 30.0, 1280, 720, 900))
-        meta = Metadata(video=info, tracklets=[])
-        path = save_meta(self.dir / "out.json", meta)
-        self.assertEqual(load_meta(path), meta)
-
-    def test_video_info_from_probe_accepts_the_real_probe_video_info(self):
-        try:
-            from auto_redact.frames import VideoInfo as ProbeVideoInfo
-        except ImportError:
-            self.skipTest("PyAV/numpy not installed")
-        probe = ProbeVideoInfo(
-            path=Path("clip.mp4"), fps=30.0, width=1280, height=720,
-            frame_count=900, duration=30.0,
-        )
-        self.assertEqual(
-            VideoInfo.from_probe(probe), VideoInfo("clip.mp4", 30.0, 1280, 720, 900)
-        )
-
-    def test_video_info_from_probe_rejects_non_probe_objects(self):
-        with self.assertRaisesRegex(MetaError, r"missing attribute\(s\)"):
-            VideoInfo.from_probe(object())
-
-    def test_to_dict_serializes_every_dataclass_field(self):
-        # Guard: a field added later must not silently go missing on disk.
-        meta = sample_metadata()
-        self.assertEqual(
-            set(meta.video.to_dict()), {f.name for f in fields(VideoInfo)}
-        )
-        self.assertEqual(
-            set(meta.tracklets[0].to_dict()), {f.name for f in fields(Tracklet)}
-        )
-        self.assertEqual(
-            set(meta.to_dict()), {f.name for f in fields(Metadata)} | {"version"}
-        )
+    assert not path.exists()
+    assert not path.with_suffix(".npz").exists()
 
 
-class ValidationTests(unittest.TestCase):
-    """Defective documents are rejected with a clear MetaError."""
-
-    def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.dir = Path(tmp.name)
-
-    def assert_load_fails(self, doc, message):
-        with self.assertRaisesRegex(MetaError, message):
-            Metadata.from_dict(doc)
-
-    def test_unsupported_version_is_rejected(self):
-        doc = valid_document()
-        doc["version"] = SCHEMA_VERSION + 1
-        self.assert_load_fails(doc, r"unsupported schema version 2")
-
-    def test_missing_version_is_rejected(self):
-        doc = valid_document()
-        del doc["version"]
-        self.assert_load_fails(doc, r"metadata: missing key\(s\): version")
-
-    def test_unknown_keys_are_rejected(self):
-        doc = valid_document()
-        doc["trackletz"] = []
-        self.assert_load_fails(doc, r"metadata: unknown key\(s\): trackletz")
-
-    def test_non_object_document_is_rejected(self):
-        self.assert_load_fails([1, 2, 3], r"metadata: expected object, got list")
-
-    def test_wrong_version_type_is_rejected(self):
-        doc = valid_document()
-        doc["version"] = True
-        self.assert_load_fails(doc, r"metadata\.version: expected integer, got bool")
-
-    def test_misaligned_tracklet_is_rejected(self):
-        doc = valid_document()
-        doc["tracklets"][0]["frames"] = [0, 1]
-        self.assert_load_fails(doc, r"frames, boxes and keypoints must be aligned")
-
-    def test_wrong_box_arity_is_rejected(self):
-        doc = valid_document()
-        doc["tracklets"][0]["boxes"] = [[0.0, 0.0, 10.0]]
-        self.assert_load_fails(doc, r"expected 4 coordinates \[x1, y1, x2, y2\]")
-
-    def test_wrong_keypoint_shape_is_rejected(self):
-        doc = valid_document()
-        doc["tracklets"][0]["keypoints"] = [[[1.0, 2.0]]]
-        self.assert_load_fails(doc, r"expected \[x, y, confidence\]")
-
-    def test_uneven_keypoint_counts_are_rejected(self):
-        doc = valid_document()
-        doc["tracklets"][0]["frames"] = [0, 1]
-        doc["tracklets"][0]["boxes"] = [[0.0, 0.0, 10.0, 10.0]] * 2
-        doc["tracklets"][0]["keypoints"] = [pose_frame(0.0), pose_frame(0.0, 16)]
-        self.assert_load_fails(doc, r"keypoints per frame must match")
-
-    def test_negative_frame_index_is_rejected(self):
-        doc = valid_document()
-        doc["tracklets"][0]["frames"] = [-1]
-        self.assert_load_fails(doc, r"non-negative integer")
-
-    def test_wrong_video_fps_type_is_rejected(self):
-        doc = valid_document()
-        doc["video"]["fps"] = "30"
-        self.assert_load_fails(doc, r"video\.fps: expected number, got str")
-
-    def test_non_positive_video_fps_is_rejected(self):
-        doc = valid_document()
-        doc["video"]["fps"] = -30
-        self.assert_load_fails(doc, r"video\.fps: expected a positive number")
-
-    def test_non_boolean_redact_is_rejected(self):
-        doc = valid_document()
-        doc["tracklets"][0]["redact"] = "yes"
-        self.assert_load_fails(doc, r"tracklet 1\.redact: expected boolean or null")
-
-    def test_non_array_tracklets_is_rejected(self):
-        doc = valid_document()
-        doc["tracklets"] = {}
-        self.assert_load_fails(doc, r"tracklets: expected array, got dict")
-
-    def test_save_refuses_to_write_an_invalid_document(self):
-        meta = Metadata(
-            video=VideoInfo("clip.mp4", 30.0, 1280, 720, 900),
-            tracklets=[
-                Tracklet(
-                    track_id=1,
-                    frames=[0, 1],
-                    boxes=[[0.0, 0.0, 10.0, 10.0]],
-                    keypoints=[pose_frame()],
-                )
-            ],
-        )
-        path = self.dir / "out.json"
-        with self.assertRaisesRegex(MetaError, r"must be aligned"):
-            save_meta(path, meta)
-        self.assertFalse(path.exists())
-
-    def test_save_rejects_non_metadata_values(self):
-        with self.assertRaisesRegex(MetaError, r"expected a Metadata instance"):
-            save_meta(self.dir / "out.json", {"version": SCHEMA_VERSION})
-
-    def test_load_rejects_invalid_json(self):
-        path = self.dir / "broken.json"
-        path.write_text("{not json", encoding="utf-8")
-        with self.assertRaisesRegex(MetaError, r"not valid JSON"):
-            load_meta(path)
-
-    def test_load_missing_file_raises_file_not_found(self):
-        with self.assertRaises(FileNotFoundError):
-            load_meta(self.dir / "does-not-exist.json")
+def test_save_refuses_a_bad_video_before_writing(tmp_path):
+    meta = sample_metadata()
+    meta.video.fps = "fast"
+    with pytest.raises(MetaError, match="fps"):
+        save_meta(tmp_path / "out.json", meta)
+    assert list(tmp_path.iterdir()) == []
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_save_rejects_non_metadata_values(tmp_path):
+    with pytest.raises(MetaError, match="expected a Metadata instance"):
+        save_meta(tmp_path / "out.json", {"version": SCHEMA_VERSION})
+
+
+def test_load_rejects_invalid_json(tmp_path):
+    path = tmp_path / "broken.json"
+    path.write_text("{not json", encoding="utf-8")
+    with pytest.raises(MetaError, match="not valid JSON"):
+        load_meta(path)
+
+
+def test_load_missing_file_raises_file_not_found(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_meta(tmp_path / "does-not-exist.json")
+
+
+def test_missing_arrays_file_is_reported(tmp_path):
+    path = save_meta(tmp_path / "out.json", sample_metadata())
+    path.with_suffix(".npz").unlink()
+    with pytest.raises(MetaError, match="arrays file"):
+        load_meta(path)
+
+
+def test_arrays_that_disagree_with_the_summary_are_rejected(tmp_path):
+    path = save_meta(tmp_path / "out.json", sample_metadata())
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["tracklets"][0]["observations"] = 99
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(MetaError, match="99 observations"):
+        load_meta(path)
+
+
+def test_tracklet_missing_from_arrays_is_rejected(tmp_path):
+    path = save_meta(tmp_path / "out.json", sample_metadata())
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["tracklets"][0]["track_id"] = 77
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(MetaError, match="no arrays stored"):
+        load_meta(path)
+
+
+def test_summary_save_updates_decisions_without_touching_the_arrays(tmp_path):
+    from auto_redact.meta import save_meta_summary
+
+    path = save_meta(tmp_path / "out.json", sample_metadata())
+    arrays = path.with_suffix(".npz")
+    before = arrays.stat().st_mtime_ns, arrays.read_bytes()
+
+    meta = load_meta(path)
+    meta.tracklets[0].override = True
+    meta.tracklets[1].redact = False
+    save_meta_summary(path, meta)
+
+    assert (arrays.stat().st_mtime_ns, arrays.read_bytes()) == before
+    again = load_meta(path)
+    assert again == meta and again.tracklets[0].override is True
+
+
+def test_summary_save_refuses_when_the_tracklets_changed(tmp_path):
+    from auto_redact.meta import save_meta_summary
+
+    path = save_meta(tmp_path / "out.json", sample_metadata())
+    meta = load_meta(path)
+    meta.tracklets.pop()
+    with pytest.raises(MetaError, match="use save_meta"):
+        save_meta_summary(path, meta)
+
+
+def test_summary_save_needs_existing_arrays(tmp_path):
+    from auto_redact.meta import save_meta_summary
+
+    with pytest.raises(MetaError, match="without its arrays"):
+        save_meta_summary(tmp_path / "nothing.json", sample_metadata())

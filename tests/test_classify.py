@@ -152,14 +152,69 @@ def test_classify_logs_decision_and_raw_reply(meta, ollama, caplog) -> None:
     assert "track 2: redact=False" in caplog.text
 
 
-def test_classify_unparseable_reply_leaves_redact_unset(meta, ollama, caplog) -> None:
+def test_classify_unparseable_reply_is_redacted_by_default(meta, ollama, caplog) -> None:
+    stub = ollama(["hmm"])
+
+    with caplog.at_level(logging.INFO, logger="auto_redact.classify"):
+        classify_snapshots(meta, "x", ollama_url=stub.url)
+
+    assert [t.redact for t in meta.tracklets] == [True, True]
+    assert "undecided, redacting by policy" in caplog.text
+    assert "hmm" in caplog.text  # the raw reply is still in the log
+
+
+def test_classification_records_the_reason(meta, ollama) -> None:
+    stub = ollama(["Yes, red shirt", "hmm"])
+    classify_snapshots(meta, "x", ollama_url=stub.url)
+    assert "Yes, red shirt" in meta.tracklets[0].detail
+    assert "undecided" in meta.tracklets[1].detail and "hmm" in meta.tracklets[1].detail
+
+
+def test_reclassifying_keeps_human_overrides(meta, ollama) -> None:
+    meta.tracklets[0].override = False
+    stub = ollama(["yes", "yes"])
+    classify_snapshots(meta, "x", ollama_url=stub.url, resume=False)
+    assert meta.tracklets[0].redact is True and meta.tracklets[0].override is False
+    assert meta.tracklets[0].effective_redact is False
+
+
+def test_on_undecided_keep_leaves_redact_unset(meta, ollama, caplog) -> None:
     stub = ollama(["hmm"])
 
     with caplog.at_level(logging.WARNING, logger="auto_redact.classify"):
-        classify_snapshots(meta, "x", ollama_url=stub.url)
+        classify_snapshots(meta, "x", ollama_url=stub.url, on_undecided="keep")
 
     assert [t.redact for t in meta.tracklets] == [None, None]
     assert "unparseable" in caplog.text
+
+
+def test_on_undecided_error_fails_after_saving_the_rest(meta, ollama, tmp_path) -> None:
+    from auto_redact.meta import load_meta, save_meta
+
+    stub = ollama(["yes", "hmm"])
+    path = save_meta(tmp_path / "m.json", meta)
+
+    with pytest.raises(ClassifyError, match=r"1 tracklet\(s\) could not be classified: \[2\]"):
+        classify_snapshots(meta, "x", ollama_url=stub.url, on_undecided="error",
+                           meta_path=path)
+
+    saved = load_meta(path)
+    assert [t.redact for t in saved.tracklets] == [True, None]
+
+
+def test_undecided_policy_keeps_clear_answers_untouched(meta, ollama) -> None:
+    stub = ollama(["no", "hmm"])
+    classify_snapshots(meta, "x", ollama_url=stub.url)
+    assert [t.redact for t in meta.tracklets] == [False, True]
+
+
+def test_classifier_exceptions_in_a_prefilter_are_undecided_too() -> None:
+    from auto_redact.classify import resolve_undecided
+
+    undecided = Decision(None, None, "siglip error")
+    assert resolve_undecided(undecided, "redact").redact is True
+    assert resolve_undecided(undecided, "keep").redact is None
+    assert resolve_undecided(Decision(False, 0.1, "x"), "redact").redact is False
 
 
 def test_classify_requires_snapshots(meta, ollama) -> None:

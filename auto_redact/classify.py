@@ -16,18 +16,18 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 import re
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable
 
 from . import telemetry
-from .meta import Metadata, save_meta, save_meta_fast
-from .track import _resolve_meta_path
+from .config import DEFAULT_SIGLIP_MODEL, ClassifyConfig, resolve
+from .meta import Metadata, save_meta
+from .protocols import Classifier
 
 logger = logging.getLogger(__name__)
 
@@ -35,14 +35,6 @@ logger = logging.getLogger(__name__)
 # serialization). The final partial batch is always saved at the end.
 SAVE_EVERY = 50
 
-DEFAULT_MODEL = "gemma3:4b"
-DEFAULT_OLLAMA_URL = "http://localhost:11434"
-DEFAULT_TIMEOUT = 120.0  # seconds per request; small VLMs can be slow on CPU
-DEFAULT_WORKERS = 1  # concurrent ollama requests
-DEFAULT_MAX_IMAGE_SIZE = 896  # downscale larger thumbnails before sending to ollama
-# Keep the model resident between requests so cold loads don't dominate
-# repeated classification calls.
-DEFAULT_KEEP_ALIVE = "10m"
 # Only the first yes/no word is parsed, so cap the reply and keep it deterministic.
 # num_ctx must cover the image tokens (variable for some VLMs, e.g. qwen3-vl);
 # keep it modest so the KV cache stays small on a small GPU.
@@ -83,12 +75,12 @@ def ask_ollama(
     image_path: str | Path,
     question: str,
     *,
-    model: str = DEFAULT_MODEL,
-    ollama_url: str = DEFAULT_OLLAMA_URL,
-    timeout: float = DEFAULT_TIMEOUT,
+    model: str = ClassifyConfig().resolved_model,
+    ollama_url: str = ClassifyConfig.ollama_url,
+    timeout: float = ClassifyConfig.timeout,
     think: bool = False,
-    keep_alive: str = DEFAULT_KEEP_ALIVE,
-    max_image_size: int = DEFAULT_MAX_IMAGE_SIZE,
+    keep_alive: str = ClassifyConfig.keep_alive,
+    max_image_size: int = ClassifyConfig.max_image_size,
 ) -> str:
     """Send one image + question to ollama and return the raw reply text.
 
@@ -165,12 +157,6 @@ class Decision:
     detail: str = ""
 
 
-class Classifier(Protocol):
-    """Common interface: judge one thumbnail against the prompt."""
-
-    def classify(self, image_path: str | Path, prompt: str) -> Decision: ...
-
-
 class VlmClassifier:
     """Yes/no questions to a local VLM served by ollama."""
 
@@ -178,12 +164,12 @@ class VlmClassifier:
 
     def __init__(
         self,
-        model: str = DEFAULT_MODEL,
-        ollama_url: str = DEFAULT_OLLAMA_URL,
-        timeout: float = DEFAULT_TIMEOUT,
+        model: str = ClassifyConfig().resolved_model,
+        ollama_url: str = ClassifyConfig.ollama_url,
+        timeout: float = ClassifyConfig.timeout,
         think: bool = False,
-        keep_alive: str = DEFAULT_KEEP_ALIVE,
-        max_image_size: int = DEFAULT_MAX_IMAGE_SIZE,
+        keep_alive: str = ClassifyConfig.keep_alive,
+        max_image_size: int = ClassifyConfig.max_image_size,
     ) -> None:
         self.model = model
         self.ollama_url = ollama_url
@@ -208,61 +194,95 @@ class VlmClassifier:
 
 
 
-def _siglip_type():
+def resolve_undecided(decision: Decision, policy: str) -> Decision:
+    """Apply the ``on_undecided`` policy to one verdict.
+
+    Only ``"redact"`` rewrites it (to a redact decision, keeping the score and
+    noting why in ``detail``); with ``"keep"`` or ``"error"`` the verdict stays
+    undecided (``redact=None``) and the caller handles it.
+    """
+    if decision.redact is None and policy == "redact":
+        return Decision(True, decision.score, f"undecided, redacting by policy ({decision.detail})")
+    return decision
+
+
+def _is_siglip(classifier: object) -> bool:
     try:
         from .siglip import SiglipClassifier
-        return SiglipClassifier
     except Exception:
-        return type(None)
+        return False
+    return isinstance(classifier, SiglipClassifier)
+
+
+def make_classifier(config: ClassifyConfig) -> Classifier:
+    """The classifier backend selected by ``config.classifier``."""
+    if config.classifier == "siglip":
+        from .siglip import SiglipClassifier
+
+        return SiglipClassifier(
+            config.resolved_model, config.threshold, config.device
+        )
+    if config.classifier == "vlm":
+        return VlmClassifier(
+            config.resolved_model,
+            config.ollama_url,
+            config.timeout,
+            config.think,
+            config.keep_alive,
+            config.max_image_size,
+        )
+    raise ValueError(f"unknown classifier {config.classifier!r}; use 'vlm' or 'siglip'")
+
+
+def make_prefilter(config: ClassifyConfig) -> Classifier | None:
+    """The SigLIP pre-filter, or None when ``config.prefilter`` is ``none``."""
+    if config.classifier != "vlm" or config.prefilter not in ("negatives", "positives"):
+        return None
+    from .siglip import SiglipClassifier
+
+    return SiglipClassifier(
+        config.prefilter_model or DEFAULT_SIGLIP_MODEL,
+        config.prefilter_threshold
+        if config.prefilter_threshold is not None
+        else ClassifyConfig.threshold,
+        config.prefilter_device,
+    )
 
 
 def classify_snapshots(
     meta: Metadata,
     prompt: str,
+    config: ClassifyConfig | None = None,
     *,
-    model: str = DEFAULT_MODEL,
-    ollama_url: str = DEFAULT_OLLAMA_URL,
-    timeout: float = DEFAULT_TIMEOUT,
-    think: bool = False,
-    keep_alive: str = DEFAULT_KEEP_ALIVE,
-    max_image_size: int = DEFAULT_MAX_IMAGE_SIZE,
-    prefilter: str = "none",
-    prefilter_model: str = None,
-    prefilter_threshold: float = None,
-    prefilter_device: str = "auto",
     classifier: Classifier | None = None,
+    prefilter_classifier: Classifier | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     on_prefilter_progress: Callable[[int, int], None] | None = None,
-    workers: int = DEFAULT_WORKERS,
     resume: bool = True,
-    meta_path=None,
-    save_path=None,
-    checkpoint_path=None,
-    checkpoint=None,
-    output=None,
-    out=None,
-    path=None,
-    file=None,
-    destination=None,
-    dest=None,
-    **kwargs,
+    meta_path: str | Path | None = None,
+    **overrides,
 ) -> Metadata:
     """Set ``redact`` (and ``score`` if available) on every tracklet.
 
-    Uses ``classifier`` if given, else a :class:`VlmClassifier` built from
-    ``model``/``ollama_url``/``timeout``. Updates ``meta`` in place and
-    returns it. An undecided verdict leaves that tracklet's ``redact`` as
-    None (and logs a warning).
+    Uses ``classifier`` if given, else the backend ``config`` selects (see
+    :func:`make_classifier`); keyword ``overrides`` adjust ``config``. With
+    ``config.prefilter`` set, a SigLIP pre-filter (``prefilter_classifier``
+    or one built by :func:`make_prefilter`) decides which tracklets the VLM
+    re-checks. Updates ``meta`` in place and returns it. An undecided
+    verdict leaves that tracklet's ``redact`` as None (and logs a warning).
 
-    ``workers`` classifies that many tracklets concurrently, but only for
-    classifiers that declare ``thread_safe`` (the ollama one does); others
-    run sequentially. Results are identical either way.
+    ``config.workers`` classifies that many tracklets concurrently, but only
+    for classifiers that declare ``thread_safe`` (the ollama one does);
+    others run sequentially. Results are identical either way.
 
     Raises:
         ClassifyError: empty prompt, a tracklet without a snapshot (run
             ``snapshot`` first), or the classifier failing.
         FileNotFoundError: a recorded snapshot file is missing.
     """
+    cfg = resolve(ClassifyConfig, config, overrides)
+    workers = cfg.workers
+    prefilter = cfg.prefilter
     if not prompt or not prompt.strip():
         raise ClassifyError("prompt must not be empty")
     missing = [
@@ -273,7 +293,7 @@ def classify_snapshots(
             f"tracklet(s) {missing} have no snapshot; run `auto-redact snapshot` first"
         )
     if classifier is None:
-        classifier = VlmClassifier(model, ollama_url, timeout, think, keep_alive, max_image_size)
+        classifier = make_classifier(cfg)
 
     if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
         raise ValueError(f"workers must be an integer >= 1, got {workers!r}")
@@ -282,29 +302,7 @@ def classify_snapshots(
         if not path.is_file():
             raise FileNotFoundError(f"no such snapshot file: {path}")
 
-    # Collect any extra path-like keyword.
-    for key, value in list(kwargs.items()):
-        if value is None:
-            continue
-        low = key.lower()
-        if isinstance(value, (str, Path, os.PathLike)) and (
-            "meta" in low or "path" in low or "out" in low
-            or "dest" in low or "save" in low or "checkpoint" in low
-        ):
-            if meta_path is None and save_path is None and checkpoint_path is None and output is None and out is None and path is None:
-                meta_path = value
-    target = _resolve_meta_path(
-        meta_path=meta_path,
-        save_path=save_path,
-        checkpoint_path=checkpoint_path,
-        checkpoint=checkpoint,
-        output=output,
-        out=out,
-        path=path,
-        file=file,
-        destination=destination,
-        dest=dest,
-    )
+    target = Path(meta_path) if meta_path is not None else None
 
     ckpt_path = (
         target.with_name(target.name + ".classify.ckpt.json")
@@ -315,6 +313,7 @@ def classify_snapshots(
         for tracklet in meta.tracklets:
             tracklet.redact = None
             tracklet.score = None
+            tracklet.detail = None
 
     if resume and ckpt_path is not None and ckpt_path.is_file():
         try:
@@ -327,6 +326,7 @@ def classify_snapshots(
                 if tracklet is None or tracklet.redact is not None:
                     continue
                 tracklet.redact = record.get("redact")
+                tracklet.detail = record.get("detail")
                 tracklet.score = record.get("score")
         except (OSError, ValueError, TypeError):
             pass
@@ -340,8 +340,10 @@ def classify_snapshots(
     already_done = total - len(pending)
 
     def apply(tracklet, decision: Decision) -> None:
+        decision = resolve_undecided(decision, cfg.on_undecided)
         tracklet.redact = decision.redact
         tracklet.score = decision.score
+        tracklet.detail = decision.detail or None
         if decision.redact is None:
             logger.warning(
                 "track %s: unparseable or undecided, redact left unset (%s)",
@@ -362,7 +364,8 @@ def classify_snapshots(
         if newly_completed % SAVE_EVERY == 0 or newly_completed == total_pending:
             try:
                 completed = [
-                    {"track_id": t.track_id, "redact": t.redact, "score": t.score}
+                    {"track_id": t.track_id, "redact": t.redact, "score": t.score,
+                     "detail": t.detail}
                     for t in meta.tracklets
                     if t.redact is not None
                 ]
@@ -380,19 +383,14 @@ def classify_snapshots(
     # let the VLM handle only the subset where SigLIP is least trustworthy.
     # "negatives" -> VLM re-checks SigLIP's negatives (catches false negatives)
     # "positives" -> VLM re-checks SigLIP's positives (catches false positives)
-    prefilter = (prefilter or "none").lower()
     siglip = None
-    if prefilter in ("negatives", "positives") and classifier is not None and not isinstance(classifier, _siglip_type()):
-        try:
-            from .siglip import SiglipClassifier, DEFAULT_SIGLIP_MODEL, DEFAULT_THRESHOLD
-            siglip = SiglipClassifier(
-                prefilter_model or DEFAULT_SIGLIP_MODEL,
-                prefilter_threshold if prefilter_threshold is not None else DEFAULT_THRESHOLD,
-                prefilter_device,
-            )
-        except Exception:
-            siglip = None
-            prefilter = "none"
+    if prefilter in ("negatives", "positives") and not _is_siglip(classifier):
+        siglip = prefilter_classifier
+        if siglip is None:
+            try:
+                siglip = make_prefilter(cfg)
+            except Exception:
+                siglip = None
 
     # Determine VLM subset.
     vlm_pending = list(pending)
@@ -402,7 +400,7 @@ def classify_snapshots(
         if on_prefilter_progress is not None:
             on_prefilter_progress(0, total_pf)
         try:
-            siglip._load()
+            getattr(siglip, "_load", lambda: None)()
         except Exception as error:
             logger.warning("siglip prefilter failed to load (%s); skipping it", error)
         for n, tracklet in enumerate(pending, 1):
@@ -475,4 +473,12 @@ def classify_snapshots(
             ckpt_path.unlink(missing_ok=True)
         except Exception:
             pass
+    undecided = [t.track_id for t in meta.tracklets if t.redact is None]
+    if undecided and cfg.on_undecided == "error":
+        if target is not None:
+            save_meta(target, meta)
+        raise ClassifyError(
+            f"{len(undecided)} tracklet(s) could not be classified: {undecided} "
+            "(use --on-undecided redact to redact them instead)"
+        )
     return meta

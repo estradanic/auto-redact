@@ -14,26 +14,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 from ultralytics import YOLO
 
+from .detectors import select_device
+
 from .frames import iter_frames
-
-
-def _select_device(device: str | None) -> str:
-    """Return a device string accepted by ``model.to`` / ``predict``.
-
-    Ultralytics accepts ``"0"`` as CUDA device 0, but ``torch.nn.Module.to``
-    (which YOLO inherits) expects ``"cuda:0"`` / ``"cpu"``. Normalise here so
-    callers can use either notation.
-    """
-    if device is None or device == "auto":
-        try:
-            import torch
-
-            return "cuda:0" if torch.cuda.is_available() else "cpu"
-        except Exception:
-            return "cpu"
-    if device.isdigit():
-        return f"cuda:{device}"
-    return device
 
 
 def _draw_overlay(frame: np.ndarray, detections: list[dict[str, Any]]) -> Image.Image:
@@ -92,7 +75,7 @@ def detect_people(
         raise FileNotFoundError(f"no such video file: {video_path}")
 
     model = YOLO("yolo11n-pose.pt")
-    model.to(_select_device(device))
+    model.to(select_device(device))
 
     overlay_saved = False
 

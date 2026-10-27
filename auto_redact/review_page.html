@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>auto-redact review</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#14161a; --panel:#1d2026; --line:#2c313a; --text:#e6e8eb; --dim:#98a0ab;
+          --red:#e5484d; --green:#46a758; --amber:#f5a524; --blue:#4c8dff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.4 system-ui, sans-serif; }
+  header { display:flex; gap:18px; align-items:center; padding:10px 16px; background:var(--panel);
+           border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  .count b { font-size:16px; } .count { color:var(--dim); }
+  main { display:grid; grid-template-columns: minmax(420px, 1.15fr) minmax(380px, 1fr); gap:14px; padding:14px; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 10px; }
+  button, select, input { font:inherit; color:var(--text); background:#262b33; border:1px solid var(--line);
+          border-radius:6px; padding:5px 10px; }
+  button { cursor:pointer; } button:hover { background:#2f3540; }
+  button.on { background:var(--blue); border-color:var(--blue); }
+  button.red { border-color:var(--red); } button.green { border-color:var(--green); }
+  button.primary { background:var(--blue); border-color:var(--blue); }
+  button:disabled { opacity:.45; cursor:default; }
+  input[type=range] { padding:0; width:100%; }
+  input[type=text], input[type=number] { width:100%; }
+  #stage { position:relative; display:inline-block; max-width:100%; line-height:0; background:#000; }
+  #frame { max-width:100%; height:auto; display:block; }
+  #draw { position:absolute; inset:0; width:100%; height:100%; cursor:default; }
+  #draw.drawing { cursor:crosshair; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0; }
+  .row > .grow { flex:1; min-width:120px; }
+  .dim { color:var(--dim); } .mono { font-family:ui-monospace, monospace; font-size:12px; }
+  .tabs { display:flex; gap:6px; margin-bottom:10px; }
+  .tab { padding:5px 12px; border-radius:6px; background:none; border:1px solid var(--line); }
+  .tab.on { background:#262b33; border-color:var(--blue); }
+  .hidden { display:none !important; }
+  #cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(168px, 1fr)); gap:10px; max-height:72vh; overflow:auto; }
+  .card { border:1px solid var(--line); border-radius:8px; padding:8px; background:#191c21; }
+  .card.redact { border-color:#6b2a2d; } .card.keep { border-color:#265a32; } .card.undecided { border-color:#7a5a12; }
+  .card img { width:100%; aspect-ratio:3/4; object-fit:cover; border-radius:5px; cursor:pointer; background:#000; display:block; }
+  .card .meta { display:flex; justify-content:space-between; margin:6px 0 2px; }
+  .card .why { color:var(--dim); font-size:12px; height:2.8em; overflow:hidden; }
+  .badge { font-size:11px; padding:1px 6px; border-radius:10px; font-weight:600; }
+  .badge.redact { background:var(--red); } .badge.keep { background:var(--green); } .badge.undecided { background:var(--amber); color:#000; }
+  .badge.you { background:var(--blue); margin-left:4px; }
+  .actions { display:flex; gap:4px; margin-top:6px; } .actions button { flex:1; padding:3px 0; font-size:12px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td, th { text-align:left; padding:5px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:500; }
+  a.jump { color:var(--blue); cursor:pointer; text-decoration:none; }
+  pre { background:#101216; padding:8px; border-radius:6px; overflow:auto; margin:6px 0; }
+  .knob { display:grid; grid-template-columns: 120px 1fr 54px; gap:8px; align-items:center; margin:6px 0; }
+  .knob label { color:var(--dim); } .knob output { text-align:right; }
+  .good { color:var(--green); } .bad { color:var(--red); } .warn { color:var(--amber); }
+  #toast { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); background:#2a2f38; border:1px solid var(--line);
+           padding:8px 14px; border-radius:8px; opacity:0; transition:opacity .2s; pointer-events:none; z-index:9; }
+  #toast.show { opacity:1; } #toast.err { border-color:var(--red); }
+  progress { width:100%; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">auto-redact review</h1>
+  <span class="count"><b id="c-redact">0</b> redact</span>
+  <span class="count"><b id="c-keep">0</b> keep</span>
+  <span class="count"><b id="c-undecided">0</b> undecided</span>
+  <span class="count"><b id="c-overrides">0</b> your overrides</span>
+  <span class="count"><b id="c-leaks">0</b> leaks / <b id="c-overs">0</b> over flagged</span>
+  <span id="stale" class="warn hidden"></span>
+</header>
+
+<main>
+  <section id="viewer">
+    <h2>Frame</h2>
+    <div id="stage"><img id="frame" alt="frame"><canvas id="draw"></canvas></div>
+    <div class="row">
+      <button id="back10">«</button><button id="back1">‹</button>
+      <input id="num" type="number" min="0" style="width:90px">
+      <button id="fwd1">›</button><button id="fwd10">»</button>
+      <span class="dim mono" id="fps"></span>
+      <label class="dim"><input type="checkbox" id="overlay" checked style="width:auto"> overlay</label>
+    </div>
+    <input id="slider" type="range" min="0" value="0">
+    <div class="row">
+      <span class="dim">Flag this frame:</span>
+      <button id="mode-leak" title="Drag a box around a person who is visible but not covered">Draw leak box</button>
+      <button id="mode-over" title="Drag a box around a black box that should not be there">Draw over box</button>
+      <button id="flag-leak" title="No box: any person visible here is not covered">Leak (no box)</button>
+      <button id="flag-over" title="No box: nothing should be painted here">Over (no box)</button>
+    </div>
+    <p class="dim" style="margin:4px 0">
+      <span style="color:#e5484d">red</span> = painted with current settings ·
+      <span class="good">green</span> = tracker's person boxes (#id) ·
+      <span style="color:#f0d21e">yellow</span> leak ·
+      <span style="color:#c83cc8">magenta</span> over. Arrow keys step (shift = 10).
+    </p>
+    <h2 style="margin-top:14px">Flagged frames</h2>
+    <div id="labels" class="dim">None yet.</div>
+  </section>
+
+  <section id="side">
+    <div class="tabs">
+      <button class="tab on" data-tab="tracks">People</button>
+      <button class="tab" data-tab="tune">Tune</button>
+      <button class="tab" data-tab="render">Render</button>
+    </div>
+
+    <div id="tab-tracks">
+      <div class="row">
+        <select id="filter">
+          <option value="attention">Needs attention</option>
+          <option value="all">All</option>
+          <option value="redact">Redacted</option>
+          <option value="keep">Kept visible</option>
+          <option value="undecided">Undecided</option>
+          <option value="overridden">My overrides</option>
+        </select>
+        <span class="dim" id="shown"></span>
+      </div>
+      <div id="cards"></div>
+    </div>
+
+    <div id="tab-tune" class="hidden">
+      <h2>Render settings (preview on the frame and your flagged frames)</h2>
+      <div id="knobs"></div>
+      <div id="preview" class="dim">Move a slider to preview.</div>
+      <div class="row"><button id="reset-knobs">Reset to current</button></div>
+      <pre id="flags" class="mono hidden"></pre>
+
+      <h2 style="margin-top:16px">Suggestions from your feedback</h2>
+      <div class="row">
+        <button class="primary" id="analyze">Analyze my flags &amp; labels</button>
+        <span class="dim" id="analyze-note">Mark people (Redact/Keep) and flag frames first.</span>
+      </div>
+      <div id="analysis"></div>
+
+      <h2 style="margin-top:16px">Try a classifier on the people you labeled</h2>
+      <div class="row"><input type="text" id="try-prompt" placeholder="prompt, e.g. person in a red shirt"></div>
+      <div class="row">
+        <select id="try-classifier"><option value="">classifier: as run</option><option>vlm</option><option>siglip</option></select>
+        <input type="text" id="try-model" placeholder="model (optional)" class="grow">
+        <button id="try-run">Run</button>
+      </div>
+      <div id="try-out" class="dim"></div>
+    </div>
+
+    <div id="tab-render" class="hidden">
+      <h2>Render with the settings from the Tune tab</h2>
+      <div id="render-info" class="dim"></div>
+      <div class="row"><button class="primary" id="render-go">Render now</button></div>
+      <progress id="render-bar" value="0" max="1" class="hidden"></progress>
+      <div id="render-msg"></div>
+      <p class="dim">Your overrides are already saved with the video's data, so a normal
+      <span class="mono">auto-redact run</span> applies them too.</p>
+    </div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let S = null;            // server state
+let cur = {};            // settings being previewed
+let frameNo = 0;
+let mode = null;         // "leak" | "over" while drawing a box
+let timer = null;
+
+function toast(msg, err) {
+  const t = $("toast"); t.textContent = msg; t.className = "show" + (err ? " err" : "");
+  clearTimeout(toast.h); toast.h = setTimeout(() => (t.className = ""), 2600);
+}
+async function api(path, body) {
+  const res = await fetch(path, body === undefined ? {} : {
+    method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { toast(data.error || res.statusText, true); throw new Error(data.error || res.statusText); }
+  return data;
+}
+
+// ---------- state ----------
+async function load() {
+  S = await api("/api/state");
+  cur = {...S.settings};
+  const v = S.video;
+  $("title").textContent = "review: " + v.path.split("/").pop();
+  $("slider").max = $("num").max = v.frames - 1;
+  $("fps").textContent = v.width + "×" + v.height + " @ " + v.fps.toFixed(2) + " fps";
+  if (!S.video_exists) toast("source video not found — frames cannot be shown", true);
+  if (S.labels.ignored) { $("stale").textContent = S.labels.ignored + " old label(s) ignored: made for different tracking"; $("stale").classList.remove("hidden"); }
+  buildKnobs(); refreshCounts();
+  // nothing flagged for attention (a clean run): show everyone instead of an empty page
+  if (!S.tracks.some(t => t.effective === null || t.override !== null)) $("filter").value = "all";
+  drawCards(); drawLabels(); gotoFrame(frameNo);
+  $("render-info").textContent = S.out ? "Output: " + S.out : "Start the review with --out PATH to enable rendering.";
+  $("render-go").disabled = !S.out;
+}
+function refreshCounts() {
+  for (const k of ["redact", "keep", "undecided", "overrides"]) $("c-" + k).textContent = S.counts[k];
+  $("c-leaks").textContent = S.labels.frames.filter(f => f.kind === "leak").length;
+  $("c-overs").textContent = S.labels.frames.filter(f => f.kind === "over").length;
+}
+
+// ---------- frame viewer ----------
+function settingsQuery() { return Object.entries(cur).map(([k, v]) => k + "=" + encodeURIComponent(v)).join("&"); }
+function gotoFrame(n, now) {
+  frameNo = Math.max(0, Math.min(S.video.frames - 1, Math.round(n)));
+  $("slider").value = $("num").value = frameNo;
+  clearTimeout(timer);
+  const show = () => { $("frame").src = "/api/frame/" + frameNo + "?overlay=" + ($("overlay").checked ? 1 : 0) + "&" + settingsQuery() + "&_=" + Date.now(); };
+  now ? show() : (timer = setTimeout(show, 60));
+}
+$("slider").oninput = (e) => gotoFrame(+e.target.value);
+$("num").onchange = (e) => gotoFrame(+e.target.value, true);
+$("back1").onclick = () => gotoFrame(frameNo - 1, true); $("fwd1").onclick = () => gotoFrame(frameNo + 1, true);
+$("back10").onclick = () => gotoFrame(frameNo - 10, true); $("fwd10").onclick = () => gotoFrame(frameNo + 10, true);
+$("overlay").onchange = () => gotoFrame(frameNo, true);
+document.addEventListener("keydown", (e) => {
+  if (["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName) && e.target.type !== "range") return;
+  const step = e.shiftKey ? 10 : 1;
+  if (e.key === "ArrowLeft") { gotoFrame(frameNo - step); e.preventDefault(); }
+  if (e.key === "ArrowRight") { gotoFrame(frameNo + step); e.preventDefault(); }
+  if (e.key === "Escape") setMode(null);
+});
+$("frame").onerror = () => toast("could not load frame " + frameNo, true);
+
+// ---------- drawing a flag box ----------
+function setMode(m) {
+  mode = mode === m ? null : m;
+  $("mode-leak").classList.toggle("on", mode === "leak"); $("mode-over").classList.toggle("on", mode === "over");
+  $("draw").classList.toggle("drawing", !!mode);
+}
+$("mode-leak").onclick = () => setMode("leak"); $("mode-over").onclick = () => setMode("over");
+let drag = null;
+const cv = $("draw");
+function pos(e) { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]; }
+cv.onmousedown = (e) => { if (mode) { drag = {a: pos(e), b: pos(e)}; e.preventDefault(); } };
+cv.onmousemove = (e) => {
+  if (!drag) return; drag.b = pos(e);
+  cv.width = cv.clientWidth; cv.height = cv.clientHeight;
+  const g = cv.getContext("2d"); g.clearRect(0, 0, cv.width, cv.height);
+  g.strokeStyle = mode === "leak" ? "#f0d21e" : "#c83cc8"; g.lineWidth = 2;
+  const [x1, y1] = drag.a, [x2, y2] = drag.b;
+  g.strokeRect(x1 * cv.width, y1 * cv.height, (x2 - x1) * cv.width, (y2 - y1) * cv.height);
+};
+window.onmouseup = async () => {
+  if (!drag) return;
+  const img = $("frame"), [ax, ay] = drag.a, [bx, by] = drag.b; drag = null;
+  cv.getContext("2d").clearRect(0, 0, cv.width, cv.height);
+  const box = [Math.min(ax, bx) * img.naturalWidth, Math.min(ay, by) * img.naturalHeight,
+               Math.max(ax, bx) * img.naturalWidth, Math.max(ay, by) * img.naturalHeight].map(Math.round);
+  if (box[2] - box[0] < 4 || box[3] - box[1] < 4) return;
+  await addLabel(mode, box);
+};
+async function addLabel(kind, box) {
+  await api("/api/frame-label", {frame: frameNo, kind, box: box || null});
+  toast(kind + " flagged at frame " + frameNo + (box ? "" : " (no box)"));
+  S = await api("/api/state"); refreshCounts(); drawLabels(); gotoFrame(frameNo, true);
+}
+$("flag-leak").onclick = () => addLabel("leak"); $("flag-over").onclick = () => addLabel("over");
+function drawLabels() {
+  const L = S.labels.frames;
+  $("labels").innerHTML = L.length ? "<table>" + L.map(f =>
+    `<tr><td><span class="badge ${f.kind === "leak" ? "undecided" : "you"}">${f.kind}</span></td>
+     <td><a class="jump" data-f="${f.frame}">frame ${f.frame}</a></td>
+     <td class="dim mono">${f.box ? f.box.map(Math.round).join(", ") : "no box"}</td>
+     <td><button data-del="${f.index}" title="remove">×</button></td></tr>`).join("") + "</table>" : "None yet.";
+  $("labels").querySelectorAll("a.jump").forEach(a => a.onclick = () => gotoFrame(+a.dataset.f, true));
+  $("labels").querySelectorAll("button[data-del]").forEach(b => b.onclick = async () => {
+    await api("/api/frame-label/delete", {index: +b.dataset.del});
+    S = await api("/api/state"); refreshCounts(); drawLabels(); gotoFrame(frameNo, true); });
+}
+
+// ---------- people ----------
+function status(t) { return t.effective === true ? "redact" : t.effective === false ? "keep" : "undecided"; }
+function drawCards() {
+  const f = $("filter").value;
+  const keep = (t) => f === "all" || (f === "attention" ? (t.effective === null || t.override !== null || (t.override === null && t.labeled !== null && t.labeled !== t.redact)) :
+    f === "overridden" ? t.override !== null : status(t) === f);
+  const list = S.tracks.filter(keep);
+  $("shown").textContent = list.length + " of " + S.tracks.length;
+  $("cards").innerHTML = list.slice(0, 400).map(t => `
+    <div class="card ${status(t)}" data-id="${t.id}">
+      ${t.has_thumb ? `<img loading="lazy" src="/api/thumb/${t.id}" data-go="${t.best_frame ?? t.first}">` : `<div class="dim">no thumbnail</div>`}
+      <div class="meta"><span>#${t.id} <span class="dim">${t.first}–${t.last}</span></span>
+        <span><span class="badge ${status(t)}">${status(t) === "undecided" ? "?" : status(t)}</span>${t.override !== null ? '<span class="badge you">you</span>' : ""}</span></div>
+      <div class="dim mono">${t.score !== null ? "score " + t.score.toFixed(3) : "&nbsp;"}</div>
+      <div class="why" title="${esc(t.detail)}">${esc(t.detail)}</div>
+      <div class="actions">
+        <button class="red" data-set="true">Redact</button><button class="green" data-set="false">Keep</button><button data-set="null">Clear</button>
+      </div></div>`).join("") + (list.length > 400 ? `<div class="dim">… ${list.length - 400} more; narrow the filter</div>` : "");
+  $("cards").querySelectorAll("img[data-go]").forEach(i => i.onclick = () => gotoFrame(+i.dataset.go, true));
+  $("cards").querySelectorAll("button[data-set]").forEach(b => b.onclick = async () => {
+    const id = +b.closest(".card").dataset.id, value = JSON.parse(b.dataset.set);
+    const t = await api("/api/track", {track_id: id, redact: value});
+    S.tracks = S.tracks.map(x => x.id === id ? t : x);
+    S.counts = recount(); refreshCounts(); drawCards(); gotoFrame(frameNo, true); });
+}
+function recount() {
+  const T = S.tracks;
+  return {tracks: T.length, redact: T.filter(t => t.effective === true).length, keep: T.filter(t => t.effective === false).length,
+          undecided: T.filter(t => t.effective === null).length, overrides: T.filter(t => t.override !== null).length};
+}
+$("filter").onchange = drawCards;
+
+// ---------- tune ----------
+const KNOBS = [
+  {k: "max_gap", label: "max gap (frames)", min: 0, max: 120, step: 1},
+  {k: "smooth_window", label: "smoothing window", min: 1, max: 31, step: 2},
+  {k: "bridge_iou", label: "bridge IoU", min: 0, max: 1, step: 0.05},
+  {k: "min_track_frames", label: "min track frames", min: 1, max: 40, step: 1},
+];
+function buildKnobs() {
+  $("knobs").innerHTML = KNOBS.map(n => `<div class="knob"><label>${n.label}</label>
+    <input type="range" id="k-${n.k}" min="${n.min}" max="${n.max}" step="${n.step}" value="${cur[n.k]}"><output id="o-${n.k}">${cur[n.k]}</output></div>`).join("");
+  KNOBS.forEach(n => $("k-" + n.k).oninput = (e) => { cur[n.k] = +e.target.value; $("o-" + n.k).textContent = cur[n.k]; schedulePreview(); });
+}
+let previewTimer = null;
+function schedulePreview() { clearTimeout(previewTimer); previewTimer = setTimeout(preview, 150); gotoFrame(frameNo); }
+async function preview() {
+  const p = await api("/api/preview", {settings: cur});
+  const t = p.trial, b = p.base, changed = KNOBS.filter(n => cur[n.k] !== S.settings[n.k]);
+  const cls = (x, y, higherBetter) => x === y ? "" : ((x > y) === higherBetter ? "good" : "bad");
+  $("preview").innerHTML = t.leaks_total + t.overs_total === 0 ? "Flag some frames to see their coverage here." :
+    `Flagged leaks covered: <b class="${cls(t.leaks_covered, b.leaks_covered, true)}">${t.leaks_covered}/${t.leaks_total}</b> (now ${b.leaks_covered}) ·
+     flagged over-boxes still painted: <b class="${cls(t.overs_present, b.overs_present, false)}">${t.overs_present}/${t.overs_total}</b> (now ${b.overs_present}) ·
+     black area: <b class="${p.area_change_pct > 0 ? "warn" : ""}">${p.area_change_pct > 0 ? "+" : ""}${p.area_change_pct}%</b>`;
+  const flags = changed.map(n => `--${n.k.replace(/_/g, "-")} ${cur[n.k]}`).join(" ");
+  $("flags").classList.toggle("hidden", !changed.length);
+  $("flags").textContent = changed.length ? flags + "\n\n# or in a --config file:\n" + changed.map(n => `${n.k}: ${cur[n.k]}`).join("\n") : "";
+}
+$("reset-knobs").onclick = () => { cur = {...S.settings}; buildKnobs(); preview(); gotoFrame(frameNo, true); };
+function applySettings(s) { cur = {...cur, ...s}; buildKnobs(); preview(); gotoFrame(frameNo, true); }
+
+$("analyze").onclick = async () => {
+  const a = await api("/api/analyze", {settings: cur}); S.last = a;
+  const s = a.settings, h = [];
+  $("analyze-note").textContent = `${a.labels.tracks} people labeled, ${a.labels.leaks} leaks, ${a.labels.overs} over-boxes flagged`;
+  if (s.diagnoses.length) {
+    h.push("<h2>What went wrong at each flagged frame</h2><table><tr><th>frame</th><th>why</th><th>fix</th></tr>" +
+      s.diagnoses.map(d => `<tr><td><a class="jump" data-f="${d.frame}">${d.frame}</a><br><span class="dim">${d.kind}</span></td>
+        <td>${esc(d.message)}</td><td>${d.fix && Object.keys(d.fix).length ? '<span class="mono">' + esc(Object.entries(d.fix).map(([k, v]) => k + "=" + v).join(", ")) + "</span>" : ""}${d.advice ? "<div class='dim'>" + esc(d.advice) + "</div>" : ""}</td></tr>`).join("") + "</table>");
+    if (Object.keys(s.changes).length) {
+      const g = s.best_eval, b = s.base_eval;
+      h.push(`<h2>Suggested render settings</h2>
+        <p>Covers <b class="good">${g.leaks_covered}/${g.leaks_total}</b> flagged leaks (now ${b.leaks_covered}), ` +
+        `${g.overs_present} of ${g.overs_total} flagged over-boxes still painted (now ${b.overs_present}), black area ${s.area_change_pct > 0 ? "+" : ""}${s.area_change_pct}%.
+        <span class="dim">(${s.tried} combinations tried)</span></p>
+        <pre class="mono">${esc(s.flags)}\n\n${esc(s.yaml)}</pre><button id="use-suggestion" class="primary">Try these on the frame</button>`);
+    } else h.push("<p class='dim'>No render-setting change fixes your flagged frames (see the fixes above).</p>");
+  }
+  if (a.threshold) {
+    const t = a.threshold, cu = t.current, b = t.best;
+    h.push(`<h2>SigLIP threshold</h2><p>From ${t.labeled} labeled people (${t.positives} should be redacted): ` +
+      (cu ? `current <b>${S.classifier.threshold}</b> misses <b class="${cu.fn ? "bad" : "good"}">${cu.fn}</b> and boxes ${cu.fp} extra; ` : "") +
+      `<b>${b.threshold}</b> would miss <b class="${b.fn ? "bad" : "good"}">${b.fn}</b> and box ${b.fp} extra.</p>
+      <pre class="mono">--threshold ${b.threshold}</pre>`);
+  } else if (S.has_scores) h.push("<p class='dim'>To tune the SigLIP threshold, label at least one person to redact and one to keep.</p>");
+  $("analysis").innerHTML = h.join("") || "<p class='dim'>Nothing to analyze yet: flag frames or label people first.</p>";
+  $("analysis").querySelectorAll("a.jump").forEach(x => x.onclick = () => gotoFrame(+x.dataset.f, true));
+  const use = $("use-suggestion"); if (use) use.onclick = () => applySettings(s.best);
+};
+
+$("try-run").onclick = async () => {
+  $("try-out").textContent = "running the classifier on your labeled people…";
+  try {
+    const r = await api("/api/try-classifier", {prompt: $("try-prompt").value, options: {classifier: $("try-classifier").value, model: $("try-model").value}});
+    const f = (x) => `catches ${x.tp}, misses <b class="${x.fn ? "bad" : "good"}">${x.fn}</b>, extra boxes ${x.fp}, correct keeps ${x.tn}`;
+    $("try-out").innerHTML = `On ${r.labeled} labeled people:<br>this run: ${f(r.tried)}${r.tried.undecided ? ` (${r.tried.undecided} undecided)` : ""}<br>as classified before: ${f(r.current)}`;
+  } catch (e) { $("try-out").textContent = ""; }
+};
+
+// ---------- render ----------
+$("render-go").onclick = async () => {
+  await api("/api/render", {settings: cur}); $("render-bar").classList.remove("hidden"); pollRender();
+};
+async function pollRender() {
+  const r = await api("/api/render-status");
+  $("render-bar").max = r.total || 1; $("render-bar").value = r.done;
+  $("render-msg").innerHTML = r.state === "running" ? `rendering… ${r.done}/${r.total}` : r.state === "done" ? `<span class="good">${esc(r.message)}</span>` : r.state === "error" ? `<span class="bad">${esc(r.message)}</span>` : "";
+  if (r.state === "running") setTimeout(pollRender, 800);
+}
+
+// ---------- tabs ----------
+document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
+  document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x === t));
+  for (const n of ["tracks", "tune", "render"]) $("tab-" + n).classList.toggle("hidden", n !== t.dataset.tab);
+  if (t.dataset.tab === "tune") preview();
+});
+load();
+</script>
+</body>
+</html>

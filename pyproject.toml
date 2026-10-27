@@ -28,6 +28,7 @@ dependencies = [
     "ultralytics>=8.4.182",
     "opencv-python",
     "numpy",
+    "msgspec",
     "pillow",
     "torch",
     "transformers",
@@ -48,6 +49,9 @@ auto-redact = "auto_redact.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["auto_redact*"]
+
+[tool.setuptools.package-data]
+auto_redact = ["review_page.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

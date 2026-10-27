@@ -61,10 +61,17 @@ One command runs everything:
 auto-redact run --video in.mp4 --prompt "person in a red shirt" --out redacted.mp4
 ```
 
-This writes `redacted.mp4` plus a metadata cache (`redacted.meta.json`) and thumbnails
-(`redacted.meta_thumbs/`) next to it. Re-running reuses cached stages (tracking, snapshots, and
-classification for the same prompt/model), so tweaking the prompt doesn't re-track the video;
-`--force` redoes everything. Only frames with redactions are re-encoded; the rest is
+This writes `redacted.mp4` and nothing else next to it. Working data (tracking results, thumbnails,
+the stage cache) goes to a per-video directory, `~/.local/state/auto-redact/videos/<name>-<hash>/`
+(`$AUTO_REDACT_STATE_DIR` or `$XDG_STATE_HOME` to move it), keyed by the source video, so
+redacting the same video to different outputs shares its tracking. `--meta`/`--thumbs` pick
+other locations, and metadata that older versions left next to the output
+(`redacted.meta.json`) keeps being used in place. Re-running reuses a
+cached stage only when the settings that produced it, and everything upstream of it, are
+unchanged (tracked in `meta.json.cache.json`): a new prompt re-classifies only, a new
+`--padding` re-snapshots and re-classifies, a new `--stride` re-tracks. Settings that cannot
+change the result (devices, worker counts, timeouts) never invalidate anything. `--force`
+redoes everything. Only frames with redactions are re-encoded; the rest is
 stream-copied (faster, visually identical). Pass `--no-selective` for a full re-encode, where
 `--crf`/`--preset` apply to the whole video.
 
@@ -172,6 +179,7 @@ with `--streaming` the other models are still loaded, so the fallback is more li
 | VLM classifier | `gemma3:4b` via ollama (device is ollama's choice) | `--model`, `--ollama-url` |
 | Classifier | `vlm`; SigLIP threshold 0.5 | `--classifier`, `--threshold` |
 | Pre-filter | `none` | `--prefilter {negatives,positives}` |
+| Undecided people (VLM reply with no yes/no, classifier error) | **redacted** | `--on-undecided {redact,keep,error}` |
 | Encoder | `libx264` on CPU, selective re-encode | `--encoder h264_nvenc`, `--no-selective` |
 | Instrumentation | on | `--no-stats`, `AUTO_REDACT_STATS=0` |
 
@@ -201,6 +209,82 @@ or `AUTO_REDACT_STATS=0`.
   track, and results may differ between them.
 - **Model accuracy.** Small local models miss subtle attributes. Spot-check the output
   before relying on it for anything sensitive; this is a proof of concept.
+
+## Reviewing and tuning from your feedback
+
+```bash
+auto-redact review --video in.mp4 --out redacted.mp4
+```
+
+opens a page in your browser (served locally on 127.0.0.1) over the video's stored results:
+
+- **People:** every tracked person with the classifier's decision, score and reason (the VLM's
+  reply, or the SigLIP score). Click *Redact* / *Keep* to overrule it. Your verdict is saved as a
+  human `override` on the tracklet and in `labels.json`, applied by every later `run`, and never
+  discarded by re-classifying.
+- **Frame viewer:** scrub the video with the redaction boxes drawn on top (red = painted, green =
+  the tracker's person boxes). Where someone is visible but not covered, drag a box around them
+  (*leak*); where a box shouldn't be, flag it (*over*).
+- **Tune:** *Analyze* explains each flagged frame (never detected, tracked but not flagged,
+  dropped by `min_track_frames`, in a gap wider than `max_gap`, smoothing lag, or off the end of
+  a track) and which setting would fix it. It then finds the render settings that cover your
+  leaks with the least extra black area and, if you labeled people, the SigLIP `--threshold`
+  that matches them (misses are weighed before extra boxes). Sliders preview any setting on your
+  flagged frames before you commit; *Try a classifier* scores a prompt or model on just the
+  people you labeled. Suggestions are shown with their evidence and are never applied
+  automatically; copy the flags, or use *Render now*.
+
+Labels are tied to the tracking they were made on; after a re-track they are reported as stale
+and ignored. Frames the detector never saw a person in can't be fixed by a render setting, and
+the page says so and points at `--track-conf`, `imgsz` or `--orphans` instead.
+
+## Managing stored data
+
+`auto-redact clean` lists what is stored (per-video workspaces and run logs, with sizes and
+whether the source video still exists). Select what to delete with `--all`, `--missing` (video
+gone), `--video PATH`, `--older-than DAYS` (alone, or to narrow another selector) and `--runs`
+(run logs); `--dry-run` previews, and it asks before deleting unless you pass `--yes`.
+Workspaces holding review labels are hand-made work and are skipped unless you add `--labeled`.
+
+## Tuning options
+
+`--help` lists the options you are likely to change. The snapshot-scoring weights
+(`head_weight`, `body_weight`, `edge_penalty`, `edge_tolerance`, `distractor_weight`,
+`same_person_iou`, `isolate_dilate`, `closeup_area_fraction`) are internal tuning and are left
+out of it, but every option can be set with `--set NAME=VALUE` (repeatable, also accepts
+`snapshot.head_weight`-style names) or as a key in a `--config` file:
+
+```bash
+auto-redact run ... --set head_weight=0.1 --set closeup_area_fraction=0.3
+```
+
+## Code layout
+
+Every tunable lives in one place, [`auto_redact/config.py`](auto_redact/config.py): a frozen
+dataclass per stage (`TrackConfig`, `SnapshotConfig`, `ClassifyConfig`, `RenderConfig`). Stage
+functions take a config object (keyword overrides are accepted too), and the command-line
+options and their help text are generated from the same fields, so a new setting is one new
+field. Fields marked `cache=False` are execution-only and stay out of the stage cache keys.
+
+| Module | Role |
+|---|---|
+| `config`, `cache` | settings; stage fingerprints that decide what a re-run can reuse |
+| `track`, `scene` | detection, tracking, scene-cut splitting |
+| `snapshot` | best-view selection and bystander isolation |
+| `classify`, `siglip` | classifier backends (`protocols.Classifier`), `make_classifier` |
+| `boxes` | which boxes to paint on which frames (gap filling, smoothing, bridging) |
+| `encode`, `segments`, `render` | encoder backends (`protocols.Encoder`), selective GOP copy, orchestration |
+| `geometry` | pure box math shared by the above |
+| `detectors` | the only module that imports ultralytics: `PersonTracker` / `PersonDetector` |
+| `workspace`, `labels` | where run data lives and `clean`; your review verdicts |
+| `tune`, `review` | pure tuning logic (diagnosis, setting/threshold search); the review server and page |
+| `meta` | the metadata document: small JSON summary + compressed `.npz` arrays |
+| `pipeline`, `streaming`, `cli` | staged and single-pass runners; the command line |
+
+The metadata JSON holds the video info, scene cuts and each tracklet's snapshot and
+classification fields (edit `redact` by hand if you like); the bulk per-frame boxes and
+keypoints live in the `.npz` beside it. Older single-file (schema v1) metadata still loads, and
+a metadata file from before the stage cache existed is trusted once and checked from then on.
 
 ## Development
 

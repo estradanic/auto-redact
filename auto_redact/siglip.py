@@ -18,11 +18,9 @@ from pathlib import Path
 
 from . import telemetry
 from .classify import ClassifyError, Decision
+from .config import DEFAULT_SIGLIP_MODEL, ClassifyConfig
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_SIGLIP_MODEL = "google/siglip2-base-patch16-224"
-DEFAULT_THRESHOLD = 0.5
 
 _COLORS = (
     "red", "orange", "yellow", "green", "blue", "purple",
@@ -61,7 +59,7 @@ class SiglipClassifier:
     def __init__(
         self,
         model: str = DEFAULT_SIGLIP_MODEL,
-        threshold: float = DEFAULT_THRESHOLD,
+        threshold: float = ClassifyConfig.threshold,
         device: str = "auto",
     ) -> None:
         if not 0.0 <= threshold <= 1.0:

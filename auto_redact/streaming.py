@@ -23,14 +23,12 @@ output until they are classified, the same as the staged worst case.
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 import os
 import queue
 import shutil
 import tempfile
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,57 +39,29 @@ import numpy as np
 from PIL import Image
 
 from . import telemetry
-from .classify import (
-    DEFAULT_MAX_IMAGE_SIZE,
-    DEFAULT_MODEL,
-    DEFAULT_OLLAMA_URL,
-    DEFAULT_TIMEOUT,
-    DEFAULT_WORKERS,
-    Decision,
-    VlmClassifier,
+from . import cache
+from .classify import ClassifyError, Decision, make_classifier, make_prefilter, resolve_undecided
+from .config import Config
+from .encode import (
+    check_crf,
+    concat_video,
+    encode_full,
+    make_encoder,
+    mux_audio,
+    run_with_fallback,
 )
 from .frames import iter_frames, probe_video
+from .geometry import clamped_area
 from .meta import Metadata, MetaError, Tracklet, VideoInfo, load_meta, save_meta
-from .pipeline import _classify_key, run_pipeline
-from .render import (
-    DEFAULT_BRIDGE_IOU,
-    DEFAULT_CRF,
-    DEFAULT_ENCODER,
-    DEFAULT_MAX_GAP,
-    DEFAULT_MIN_TRACK_FRAMES,
-    DEFAULT_PRESET,
-    DEFAULT_SMOOTH_WINDOW,
-    ENCODERS,
-    RenderError,
-    _check_crf,
-    _concat_video,
-    _copy_segment,
-    _encode,
-    _encode_segment,
-    _keyframe_table,
-    _mux_audio,
-    nvenc_fallback_preset,
-    _Segment,
-    redaction_boxes,
-    render_redacted,
-)
+from .boxes import redaction_boxes
+from .pipeline import run_pipeline, snapshots_done
+from .workspace import resolve_run_paths
+from .render import render_redacted
+from .segments import Segment, copy_segment, encode_segment, keyframe_table
 from .scene import _frame_hist
-from .siglip import DEFAULT_SIGLIP_MODEL, DEFAULT_THRESHOLD, SiglipClassifier
 from .snapshot import (
-    BODY_WEIGHT,
-    CLOSEUP_AREA_FRACTION,
     CONTACT_SHEET_CELL,
-    DEFAULT_CONTACT_SHEET,
-    DEFAULT_PADDING,
-    DISTRACTOR_WEIGHT,
-    EDGE_PENALTY,
-    EDGE_TOLERANCE,
-    HEAD_WEIGHT,
-    ISOLATE_DILATE,
     JPEG_QUALITY,
-    SAME_PERSON_IOU,
-    _clamped_area,
-    _load_yolo,
     _padded_crop_window,
     crop_snapshot,
     observation_score,
@@ -99,7 +69,8 @@ from .snapshot import (
     sub_isolate_people,
     write_contact_sheet,
 )
-from .track import _extract, _same_video, _select_device
+from .detectors import make_detector, make_tracker
+from .protocols import PersonDetector, PersonTracker
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +148,7 @@ class _Frontier:
     def decide(self, track: _Track) -> None:
         with self.cv:
             self.undecided.pop(track.uid, None)
-            if track.tl.redact is True:
+            if track.tl.effective_redact is True:
                 self.redacted.append(track.tl)
             self.cv.notify_all()
 
@@ -227,7 +198,7 @@ class _Frontier:
 class _LazyBoxes:
     """``boxes.get(frame)`` that blocks until the frame is final.
 
-    Lets the staged ``_encode`` loop run unchanged while it is fed by an
+    Lets the staged ``encode_full`` loop run unchanged while it is fed by an
     ongoing analysis: it decodes frame N, asks for its boxes, and waits here
     until they cannot change any more.
     """
@@ -250,17 +221,6 @@ class _LazyBoxes:
             self.chunk = chunk
         self.shipped = idx + 1
         return self.boxes.get(idx, default)
-
-
-def _track_buffer(tracker: str) -> int:
-    try:
-        import yaml
-        from ultralytics.utils.checks import check_yaml
-
-        with open(check_yaml(tracker), encoding="utf-8") as handle:
-            return int(yaml.safe_load(handle)["track_buffer"])
-    except Exception:
-        return 30
 
 
 def _decode_thread(video: Path, out: queue.Queue, abort: threading.Event,
@@ -297,8 +257,9 @@ class _Decider:
     def __init__(self, *, frontier, info, thumbs, prompt, padding, isolate,
                  sub_isolate, closeup_area_fraction, same_person_iou,
                  isolate_dilate, classifier, prefilter_clf, prefilter,
-                 workers) -> None:
+                 workers, detector=None, on_undecided="redact") -> None:
         self.frontier = frontier
+        self.on_undecided = on_undecided
         self.w, self.h = info.width, info.height
         self.thumbs = thumbs
         self.prompt = prompt
@@ -311,11 +272,11 @@ class _Decider:
         self.pre_clf = prefilter_clf
         self.prefilter = prefilter
         self.sub_isolate = sub_isolate
-        self.sub_model = None
+        self.sub_model = detector
         self.sub_lock = threading.Lock()
-        if sub_isolate:
+        if sub_isolate and self.sub_model is None:
             try:
-                self.sub_model = _load_yolo("cpu")
+                self.sub_model = make_detector("cpu")
             except Exception:
                 self.sub_model = None
         self.pool = ThreadPoolExecutor(max_workers=max(1, int(workers)), thread_name_prefix="decide")
@@ -336,8 +297,10 @@ class _Decider:
             logger.warning("track %s: decision failed (%s: %s)", track.uid, type(error).__name__, error)
             logger.debug("decision traceback", exc_info=True)
             decision = Decision(None, None, f"error: {error}")
+        decision = resolve_undecided(decision, self.on_undecided)
         tl = track.tl
         tl.redact, tl.score = decision.redact, decision.score
+        tl.detail = decision.detail or None
         if decision.redact is None:
             logger.warning("track %s: unparseable or undecided, redact left unset (%s)", track.uid, decision.detail)
         else:
@@ -352,7 +315,7 @@ class _Decider:
             return None
         box, crop, tl = track.best_box, track.best_crop, track.tl
         window = _padded_crop_window(box, self.w, self.h, self.padding)
-        fraction = _clamped_area(box, self.w, self.h) / max(1.0, float(self.w) * float(self.h))
+        fraction = clamped_area(box, self.w, self.h) / max(1.0, float(self.w) * float(self.h))
         closeup = fraction >= self.closeup
         if self.isolate and not closeup:
             crop, painted = redact_others(
@@ -421,21 +384,19 @@ class _SelectiveShipper(threading.Thread):
 
     def _ship(self, edited: bool, lo: int, hi: int, boxes) -> None:
         part = self.work_dir / f"part_{lo:08d}.mp4"
-        segment = _Segment(lo, hi, edited)
+        segment = Segment(lo, hi, edited)
         with telemetry.timed("ship.encode" if edited else "ship.copy"):
             if edited:
-                try:
-                    _encode_segment(self.video, part, boxes, self.keyframes, segment,
-                                    self.info, self.crf, self.preset, self.encoder)
-                except RenderError as error:
-                    if self.encoder != "h264_nvenc":
-                        raise
-                    self.preset = nvenc_fallback_preset(self.preset, error)
-                    self.encoder = "libx264"
-                    _encode_segment(self.video, part, boxes, self.keyframes, segment,
-                                    self.info, self.crf, self.preset, self.encoder)
+                # Once NVENC fails, later segments stay on the fallback.
+                self.encoder, self.preset = run_with_fallback(
+                    self.encoder, self.preset,
+                    lambda encoder, preset: encode_segment(
+                        self.video, part, boxes, self.keyframes, segment,
+                        self.info, self.crf, preset, encoder,
+                    ),
+                )
             else:
-                _copy_segment(self.video, part, self.keyframes, segment)
+                copy_segment(self.video, part, self.keyframes, segment)
         self.parts.append((lo, part))
         self.shipped_frames += hi - lo
 
@@ -478,13 +439,12 @@ class _FullShipper(threading.Thread):
     def run(self) -> None:
         video, out, info, crf, preset, encoder = self.args
         try:
-            try:
-                _encode(video, out, self.boxes, info, crf, preset, encoder)
-            except RenderError as error:
-                if encoder != "h264_nvenc":
-                    raise
-                _encode(video, out, self.boxes, info, crf,
-                        nvenc_fallback_preset(preset, error), "libx264")
+            run_with_fallback(
+                encoder, preset,
+                lambda encoder, preset: encode_full(
+                    video, out, self.boxes, info, crf, preset, encoder
+                ),
+            )
         except BaseException as error:
             self.frontier.fail(error)
 
@@ -493,131 +453,89 @@ def run_pipeline_streaming(
     video,
     prompt,
     out,
+    config: Config | None = None,
     *,
     meta_path=None,
     thumbs_dir=None,
     force=False,
-    sample_rate=1,
-    device="auto",
-    half=True,
-    track_conf=0.25,
-    track_iou=0.7,
-    track_imgsz=None,
-    track_tracker="bytetrack.yaml",
-    orphans=False,
-    resume=True,
-    padding=DEFAULT_PADDING,
-    isolate=True,
-    sub_isolate=False,
-    closeup_area_fraction=CLOSEUP_AREA_FRACTION,
-    head_weight=HEAD_WEIGHT,
-    body_weight=BODY_WEIGHT,
-    edge_penalty=EDGE_PENALTY,
-    edge_tolerance=EDGE_TOLERANCE,
-    distractor_weight=DISTRACTOR_WEIGHT,
-    same_person_iou=SAME_PERSON_IOU,
-    isolate_dilate=ISOLATE_DILATE,
-    classifier="vlm",
-    model=None,
-    threshold=DEFAULT_THRESHOLD,
-    classify_device="auto",
-    ollama_url=DEFAULT_OLLAMA_URL,
-    timeout=DEFAULT_TIMEOUT,
-    classify_workers=DEFAULT_WORKERS,
-    think=False,
-    max_image_size=DEFAULT_MAX_IMAGE_SIZE,
-    prefilter="none",
-    prefilter_model=None,
-    prefilter_threshold=None,
-    prefilter_device="auto",
-    keep_alive="3h",
-    crf=DEFAULT_CRF,
-    preset=DEFAULT_PRESET,
-    selective=True,
-    encoder=DEFAULT_ENCODER,
-    max_gap=DEFAULT_MAX_GAP,
-    smooth_window=DEFAULT_SMOOTH_WINDOW,
-    bridge_iou=DEFAULT_BRIDGE_IOU,
-    min_track_frames=DEFAULT_MIN_TRACK_FRAMES,
-    scene_cuts=True,
-    scene_cut_threshold=0.45,
     progress=lambda message: None,
     bar=lambda desc, **_: contextlib.nullcontext(),
+    tracker: PersonTracker | None = None,
+    detector: PersonDetector | None = None,
 ) -> dict:
-    if classifier not in ("vlm", "siglip"):
-        raise ValueError(f"unknown classifier {classifier!r}; use 'vlm' or 'siglip'")
-    if model is None:
-        model = DEFAULT_SIGLIP_MODEL if classifier == "siglip" else DEFAULT_MODEL
-    _check_crf(crf)
-    if encoder not in ENCODERS:
-        raise RenderError(f"encoder must be one of {ENCODERS}, got {encoder!r}")
+    cfg = config if config is not None else Config()
+    track_cfg, snapshot_cfg, classify_cfg, render_cfg = (
+        cfg.track, cfg.snapshot, cfg.classify, cfg.render
+    )
+    sample_rate = track_cfg.stride
+    orphans = track_cfg.orphans
+    scene_cuts, scene_cut_threshold = track_cfg.scene_cuts, track_cfg.scene_cut_threshold
+    padding, isolate, sub_isolate = snapshot_cfg.padding, snapshot_cfg.isolate, snapshot_cfg.sub_isolate
+    closeup_area_fraction = snapshot_cfg.closeup_area_fraction
+    same_person_iou, isolate_dilate = snapshot_cfg.same_person_iou, snapshot_cfg.isolate_dilate
+    crf, preset, selective = render_cfg.crf, render_cfg.preset, render_cfg.selective
+    max_gap, smooth_window = render_cfg.max_gap, render_cfg.smooth_window
+    bridge_iou, min_track_frames = render_cfg.bridge_iou, render_cfg.min_track_frames
+    head_weight, body_weight = snapshot_cfg.head_weight, snapshot_cfg.body_weight
+    edge_penalty, edge_tolerance = snapshot_cfg.edge_penalty, snapshot_cfg.edge_tolerance
+    distractor_weight = snapshot_cfg.distractor_weight
+    classify_workers = classify_cfg.workers
+    encoder = make_encoder(render_cfg.encoder)
+    check_crf(crf)
     if not isinstance(sample_rate, int) or isinstance(sample_rate, bool) or sample_rate < 1:
-        raise ValueError(f"sample_rate must be an integer >= 1, got {sample_rate!r}")
+        raise ValueError(f"stride must be an integer >= 1, got {sample_rate!r}")
 
     video, out = Path(video), Path(out)
     if not video.is_file():
         raise FileNotFoundError(f"no such video file: {video}")
-    meta_file = Path(meta_path) if meta_path else out.with_name(out.stem + ".meta.json")
-    thumbs = Path(thumbs_dir) if thumbs_dir else meta_file.with_name(meta_file.stem + "_thumbs")
-    sidecar = meta_file.with_name(meta_file.name + ".classify.json")
+    meta_file, thumbs = resolve_run_paths(video, out, meta_path, thumbs_dir, progress)
+    stages = cache.StageCache(meta_file)
+    track_key = cache.track_key(video, track_cfg)
+    snapshot_key = cache.snapshot_key(track_key, snapshot_cfg, thumbs)
+    classify_key = cache.classify_key(snapshot_key, prompt, classify_cfg)
     info = probe_video(video)
 
     # With tracking and snapshots already cached there is nothing left to
     # overlap; the staged pipeline reuses them and only redoes what changed.
-    if not force and meta_file.is_file():
+    if (
+        not force
+        and meta_file.is_file()
+        and stages.matches("track", track_key)
+        and stages.matches("snapshot", snapshot_key)
+    ):
         try:
             cached = load_meta(meta_file)
         except MetaError:
             cached = None
-        if (
-            cached is not None
-            and _same_video(cached, video, info)
-            and cached.tracklets
-            and all(t.best_snapshot_path and Path(t.best_snapshot_path).is_file() for t in cached.tracklets)
-        ):
+        if cached is not None and cached.tracklets and snapshots_done(cached):
             progress("[stream] tracking and snapshots cached; using the staged pipeline")
             summary = run_pipeline(
-                video, prompt, out, meta_path=meta_file, thumbs_dir=thumbs, force=False,
-                sample_rate=sample_rate, device=device, half=half, resume=resume,
-                classifier=classifier, model=model, threshold=threshold,
-                classify_device=classify_device, ollama_url=ollama_url, timeout=timeout,
-                classify_workers=classify_workers, think=think, max_image_size=max_image_size,
-                prefilter=prefilter, prefilter_model=prefilter_model,
-                prefilter_threshold=prefilter_threshold, prefilter_device=prefilter_device,
-                crf=crf, preset=preset, selective=selective, encoder=encoder,
-                max_gap=max_gap, smooth_window=smooth_window, bridge_iou=bridge_iou,
-                min_track_frames=min_track_frames, scene_cuts=scene_cuts,
-                scene_cut_threshold=scene_cut_threshold, progress=progress, bar=bar,
+                video, prompt, out, cfg, meta_path=meta_file, thumbs_dir=thumbs,
+                force=False, progress=progress, bar=bar,
             )
             return {"out": summary.out, "meta_path": summary.meta_path,
                     "tracklets": summary.tracklets, "redacted": summary.redacted}
 
-    device = _select_device(device)
-    half = half and device.startswith("cuda")
+    stages.begin("track", track_key)
     w, h = info.width, info.height
     thumbs.mkdir(parents=True, exist_ok=True)
     out.parent.mkdir(parents=True, exist_ok=True)
 
     # Classifiers.
-    if classifier == "siglip":
-        progress("      initializing classifier model")
-        clf = SiglipClassifier(model, threshold, classify_device)
-    else:
-        progress("      waiting for ollama to load the model")
-        clf = VlmClassifier(model, ollama_url, timeout, think, keep_alive, max_image_size)
-    pre_clf, prefilter = None, (prefilter or "none").lower()
-    if prefilter in ("negatives", "positives") and classifier == "vlm":
-        pre_clf = SiglipClassifier(
-            prefilter_model or DEFAULT_SIGLIP_MODEL,
-            prefilter_threshold if prefilter_threshold is not None else DEFAULT_THRESHOLD,
-            prefilter_device,
-        )
+    progress(
+        "      initializing classifier model"
+        if classify_cfg.classifier == "siglip"
+        else "      waiting for ollama to load the model"
+    )
+    clf = make_classifier(classify_cfg)
+    pre_clf = make_prefilter(classify_cfg)
+    prefilter = classify_cfg.prefilter if pre_clf is not None else "none"
 
     # Rendering mode.
     work_dir = Path(tempfile.mkdtemp(prefix="auto-redact-stream-"))
     keyframes: dict[int, int] = {}
     if selective and not orphans:
-        keyframes, open_gop = _keyframe_table(video)
+        keyframes, open_gop = keyframe_table(video)
         if open_gop or 0 not in keyframes:
             keyframes = {}
     frontier = _Frontier(
@@ -638,20 +556,14 @@ def run_pipeline_streaming(
         isolate=isolate, sub_isolate=sub_isolate, closeup_area_fraction=closeup_area_fraction,
         same_person_iou=same_person_iou, isolate_dilate=isolate_dilate, classifier=clf,
         prefilter_clf=pre_clf, prefilter=prefilter, workers=classify_workers,
+        detector=detector, on_undecided=classify_cfg.on_undecided,
     )
 
-    from ultralytics import YOLO
-
-    yolo = YOLO("yolo11n-pose.pt")
-    yolo.to(device)
-    track_kwargs = dict(conf=track_conf, iou=track_iou, persist=True, verbose=False, tracker=track_tracker)
-    if half:
-        track_kwargs["quantize"] = 16
-    if track_imgsz is not None:
-        track_kwargs["imgsz"] = track_imgsz
-    # ByteTrack drops a lost id after ``track_buffer`` tracker steps and never
-    # reuses it, so a tracklet silent for longer than that is complete.
-    close_gap = (_track_buffer(track_tracker) + 2) * sample_rate
+    if tracker is None:
+        tracker = make_tracker(track_cfg)
+    # Trackers drop a lost id after ``lost_buffer`` steps and never reuse it,
+    # so a tracklet silent for longer than that is complete.
+    close_gap = (tracker.lost_buffer + 2) * sample_rate
 
     tracks: list[_Track] = []
     open_tracks: dict[int, _Track] = {}
@@ -718,8 +630,10 @@ def run_pipeline_streaming(
                 if frame_idx % sample_rate == 0:
                     obs: dict[int, list] = {}
                     with telemetry.timed("stream.yolo"):
-                        for result in yolo.track(frame, **track_kwargs):
-                            _extract(result, frame_idx, obs)
+                        for detection in tracker.update(frame):
+                            obs.setdefault(detection.track_id, []).append(
+                                (frame_idx, detection.box, detection.keypoints)
+                            )
                     frame_obs: list[tuple[_Track, list[float], list]] = []
                     for tid, observations in obs.items():
                         for _fi, box, kps in observations:
@@ -739,7 +653,7 @@ def run_pipeline_streaming(
                             frame_obs.append((track, box, kps))
                     with telemetry.timed("stream.score"):
                         for track, box, kps in frame_obs:
-                            if _clamped_area(box, w, h) <= 0:
+                            if clamped_area(box, w, h) <= 0:
                                 continue
                             others = [(o.uid, ob) for o, ob, _ in frame_obs if o is not track]
                             score = observation_score(
@@ -785,36 +699,35 @@ def run_pipeline_streaming(
     # Final metadata, numbered exactly as the staged pipeline would.
     meta = _build_meta(video, info, tracks, cuts if scene_cuts else [], thumbs, scene_cuts)
 
-    if orphans:
-        meta = _finish_with_orphans(
-            meta, video, out, meta_file, thumbs, prompt, clf,
-            dict(
-                padding=padding, isolate=isolate, sub_isolate=sub_isolate,
-                closeup_area_fraction=closeup_area_fraction, head_weight=head_weight,
-                body_weight=body_weight, edge_penalty=edge_penalty,
-                edge_tolerance=edge_tolerance, distractor_weight=distractor_weight,
-                same_person_iou=same_person_iou, isolate_dilate=isolate_dilate,
-                classify_workers=classify_workers, crf=crf, preset=preset,
-                selective=selective, encoder=encoder, max_gap=max_gap,
-                smooth_window=smooth_window, bridge_iou=bridge_iou,
-                min_track_frames=min_track_frames,
-            ),
+    undecided = [t.track_id for t in meta.tracklets if t.redact is None]
+    if undecided and classify_cfg.on_undecided == "error":
+        shutil.rmtree(work_dir, ignore_errors=True)
+        out.unlink(missing_ok=True)
+        save_meta(meta_file, meta)
+        raise ClassifyError(
+            f"{len(undecided)} tracklet(s) could not be classified: {undecided} "
+            "(use --on-undecided redact to redact them instead); no output written"
         )
+
+    if orphans:
+        meta = _finish_with_orphans(meta, video, out, meta_file, thumbs, prompt, clf, cfg)
     elif keyframes:
         parts = [p for _, p in sorted(shipper.parts)]
         joined = work_dir / "joined.mp4"
         with telemetry.timed("ship.finalize"):
-            _concat_video(parts, joined)
-            _mux_audio(joined, video, out)
+            concat_video(parts, joined)
+            mux_audio(joined, video, out)
     shutil.rmtree(work_dir, ignore_errors=True)
 
     save_meta(meta_file, meta)
-    sidecar.write_text(json.dumps(_classify_key(prompt, classifier, model, threshold, think)) + "\n", encoding="utf-8")
+    stages.record("track", track_key)
+    stages.record("snapshot", snapshot_key)
+    stages.record("classify", classify_key)
     sheet = [(t.track_id, t_thumb) for t, t_thumb in _thumb_pairs(meta, tracks)]
     if sheet:
-        write_contact_sheet(sorted(sheet, key=lambda p: p[0]), thumbs / DEFAULT_CONTACT_SHEET)
+        write_contact_sheet(sorted(sheet, key=lambda p: p[0]), thumbs / snapshot_cfg.contact_sheet)
 
-    redacted = sum(1 for t in meta.tracklets if t.redact)
+    redacted = sum(1 for t in meta.tracklets if t.effective_redact)
     progress(f"{len(meta.tracklets)} tracklet(s), {redacted} redacted; wrote {out}")
     return {"out": out, "meta_path": meta_file, "tracklets": len(meta.tracklets), "redacted": redacted}
 
@@ -866,27 +779,15 @@ def _thumb_pairs(meta, tracks):
             yield tl, t.thumb
 
 
-def _finish_with_orphans(meta, video, out, meta_file, thumbs, prompt, clf, opts) -> Metadata:
+def _finish_with_orphans(meta, video, out, meta_file, thumbs, prompt, clf, cfg) -> Metadata:
     """Orphan recovery needs a full extra pass, so rendering stays staged."""
     from .classify import classify_snapshots
     from .snapshot import select_snapshots
     from .track import add_orphan_tracklets
 
     meta = add_orphan_tracklets(meta, video, on_progress=None)
-    select_snapshots(
-        meta, thumbs_dir=thumbs, padding=opts["padding"], isolate=opts["isolate"],
-        sub_isolate=opts["sub_isolate"], closeup_area_fraction=opts["closeup_area_fraction"],
-        head_weight=opts["head_weight"], body_weight=opts["body_weight"],
-        edge_penalty=opts["edge_penalty"], edge_tolerance=opts["edge_tolerance"],
-        distractor_weight=opts["distractor_weight"], same_person_iou=opts["same_person_iou"],
-        isolate_dilate=opts["isolate_dilate"], contact_sheet=DEFAULT_CONTACT_SHEET,
-        resume=True, meta_path=meta_file,
-    )
-    classify_snapshots(meta, prompt, classifier=clf, resume=True, meta_path=meta_file,
-                       workers=opts["classify_workers"])
-    render_redacted(
-        meta, out, crf=opts["crf"], preset=opts["preset"], selective=opts["selective"],
-        encoder=opts["encoder"], max_gap=opts["max_gap"], smooth_window=opts["smooth_window"],
-        bridge_iou=opts["bridge_iou"], min_track_frames=opts["min_track_frames"],
-    )
+    select_snapshots(meta, thumbs, cfg.snapshot, resume=True, meta_path=meta_file)
+    classify_snapshots(meta, prompt, cfg.classify, classifier=clf, resume=True,
+                       meta_path=meta_file)
+    render_redacted(meta, out, cfg.render)
     return meta

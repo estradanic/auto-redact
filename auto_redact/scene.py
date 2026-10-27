@@ -271,4 +271,6 @@ def _piece_from(
         ),
         redact=source.redact if keep_classify else None,
         score=source.score if keep_classify else None,
+        detail=source.detail if keep_classify else None,
+        override=source.override,
     )

@@ -17,16 +17,9 @@ import pytest
 from auto_redact.cli import main
 from auto_redact.frames import iter_frames, probe_video
 from auto_redact.meta import Metadata, Tracklet, VideoInfo, save_meta
-from auto_redact.render import (
-    RenderError,
-    _Segment,
-    _build_segments,
-    _fill_tracklet_gaps,
-    _keyframe_table,
-    _smooth_boxes,
-    redaction_boxes,
-    render_redacted,
-)
+from auto_redact.boxes import fill_gaps, redaction_boxes, smooth_boxes
+from auto_redact.render import RenderError, render_redacted
+from auto_redact.segments import Segment, build_segments, keyframe_table
 
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
@@ -189,7 +182,7 @@ def test_redaction_boxes_clamps_and_drops_degenerate(red_clip: Path) -> None:
 
 
 def test_fill_tracklet_gaps_interpolates_short_holes() -> None:
-    frames, boxes = _fill_tracklet_gaps(
+    frames, boxes = fill_gaps(
         [0, 3],
         [[0.0, 0.0, 10.0, 10.0], [30.0, 0.0, 40.0, 10.0]],
         max_gap=5,
@@ -200,7 +193,7 @@ def test_fill_tracklet_gaps_interpolates_short_holes() -> None:
 
 
 def test_fill_tracklet_gaps_skips_holes_over_max_gap() -> None:
-    frames, boxes = _fill_tracklet_gaps(
+    frames, boxes = fill_gaps(
         [0, 5],
         [[0.0, 0.0, 10.0, 10.0], [50.0, 0.0, 60.0, 10.0]],
         max_gap=2,
@@ -216,7 +209,7 @@ def test_smooth_boxes_averages_within_contiguous_runs() -> None:
         [30.0, 0.0, 40.0, 10.0],
         [60.0, 0.0, 70.0, 10.0],
     ]
-    smoothed = _smooth_boxes(frames, boxes, window=3)
+    smoothed = smooth_boxes(frames, boxes, window=3)
     assert smoothed[1] == pytest.approx([30.0, 0.0, 40.0, 10.0])
     # Endpoints average with their one neighbour only.
     assert smoothed[0] == pytest.approx([15.0, 0.0, 25.0, 10.0])
@@ -403,7 +396,7 @@ def test_cli_render_requires_meta_and_out() -> None:
 
 
 def test_keyframe_table_reports_keyframe_indices(gop_clip: Path) -> None:
-    keyframes, _ = _keyframe_table(gop_clip)
+    keyframes, _ = keyframe_table(gop_clip)
     assert sorted(keyframes) == [0, 10, 20, 30, 40]
 
 
@@ -411,23 +404,23 @@ def test_build_segments_aligns_to_keyframes_and_merges() -> None:
     kf = {0: 0, 10: 1, 20: 2, 30: 3, 40: 4}
     # A redaction inside one GOP re-encodes just that GOP; the rest is copied
     # and adjacent copy chunks merge.
-    assert _build_segments({12, 13}, kf, 50) == [
-        _Segment(0, 10, False),
-        _Segment(10, 20, True),
-        _Segment(20, 50, False),
+    assert build_segments({12, 13}, kf, 50) == [
+        Segment(0, 10, False),
+        Segment(10, 20, True),
+        Segment(20, 50, False),
     ]
     # A redaction spanning two GOPs merges them into one edited chunk.
-    assert _build_segments({15, 25}, kf, 50) == [
-        _Segment(0, 10, False),
-        _Segment(10, 30, True),
-        _Segment(30, 50, False),
+    assert build_segments({15, 25}, kf, 50) == [
+        Segment(0, 10, False),
+        Segment(10, 30, True),
+        Segment(30, 50, False),
     ]
     # No redactions -> a single copied chunk; redaction at frame 0 edits the
     # leading GOP.
-    assert _build_segments(set(), kf, 50) == [_Segment(0, 50, False)]
-    assert _build_segments({0}, kf, 50) == [
-        _Segment(0, 10, True),
-        _Segment(10, 50, False),
+    assert build_segments(set(), kf, 50) == [Segment(0, 50, False)]
+    assert build_segments({0}, kf, 50) == [
+        Segment(0, 10, True),
+        Segment(10, 50, False),
     ]
 
 
@@ -578,3 +571,15 @@ def test_unknown_encoder_rejected(gop_red_clip: Path, tmp_path: Path) -> None:
     meta = make_meta(gop_red_clip, [])
     with pytest.raises(RenderError, match="encoder"):
         render_redacted(meta, tmp_path / "x.mp4", encoder="nope")
+
+
+def test_a_human_override_beats_the_classifier_in_the_rendered_boxes(red_clip: Path) -> None:
+    keep = make_tracklet(1, [0, 1], [[10, 10, 20, 20]] * 2, False)
+    keep.override = True  # reviewer says: redact after all
+    drop = make_tracklet(2, [0, 1], [[30, 30, 40, 40]] * 2, True)
+    drop.override = False  # reviewer says: leave visible
+    boxes = redaction_boxes(
+        make_meta(red_clip, [keep, drop]),
+        max_gap=0, smooth_window=1, bridge_iou=0, min_track_frames=1,
+    )
+    assert boxes == {0: [(10, 10, 20, 20)], 1: [(10, 10, 20, 20)]}
