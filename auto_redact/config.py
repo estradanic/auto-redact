@@ -240,7 +240,8 @@ class ClassifyConfig:
     )
     prefilter_device: str = _opt(
         "auto",
-        "prefilter: device for SigLIP (default: %(default)s)",
+        "prefilter: device for SigLIP (default: %(default)s; 'auto' uses the "
+        "GPU only if enough VRAM is free to also hold the VLM)",
         metavar="DEV",
         cache=False,
     )

@@ -17,7 +17,9 @@ imports ``ultralytics``. Tests and other backends supply their own.
 from __future__ import annotations
 
 import logging
+import os
 import threading
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -25,7 +27,9 @@ import numpy as np
 from .config import TrackConfig
 from .protocols import Detection
 
-_WEIGHTS = "yolo11n-pose.pt"
+_WEIGHTS_DIR = Path(os.path.expanduser("~/.cache/auto-redact/weights"))
+_WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+_WEIGHTS = str(_WEIGHTS_DIR / "yolo11n-pose.pt")
 _KEYPOINTS = 17  # COCO pose
 
 
@@ -126,6 +130,17 @@ class UltralyticsTracker:
         if config.imgsz is not None:
             self._kwargs["imgsz"] = config.imgsz
         self.lost_buffer = _track_buffer(config.tracker)
+
+    def close(self) -> None:
+        """Release the underlying model and any GPU memory it holds."""
+        self._model = None
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     def update(self, frame: np.ndarray) -> list[Detection]:
         detections: list[Detection] = []

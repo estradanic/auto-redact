@@ -210,7 +210,8 @@ def encode_full(
     command += ["-map", "0:v:0"]
     if audio:
         command += ["-map", "1:a:0", "-c:a", "copy"]
-    command += [*encoder.codec_args(crf, preset), "-pix_fmt", "yuv420p", str(out)]
+    command += [*encoder.codec_args(crf, preset), "-pix_fmt", "yuv420p",
+               "-movflags", "frag_keyframe+empty_moov", str(out)]
 
     with ffmpeg_stdin(command, source) as stdin:
         for frame_idx, frame in iter_frames(source):

@@ -92,7 +92,8 @@ def run_pipeline(
         stages.begin("track", track_key)
         with telemetry.stage("track"), bar("track") as on_progress:
             meta = build_tracklets(
-                video, cfg.track, on_progress=on_progress, meta_path=meta_file
+                video, cfg.track, on_progress=on_progress, meta_path=meta_file,
+                resume=resume and not force,
             )
         if cfg.track.orphans:
             with telemetry.stage("orphan"), bar("orphan") as orphan_progress:

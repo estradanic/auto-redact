@@ -14,6 +14,8 @@ import numpy as np
 from PIL import Image, ImageDraw
 from ultralytics import YOLO
 
+from .detectors import _WEIGHTS as _YOLO_WEIGHTS
+
 from .detectors import select_device
 
 from .frames import iter_frames
@@ -74,7 +76,7 @@ def detect_people(
     if not video_path.is_file():
         raise FileNotFoundError(f"no such video file: {video_path}")
 
-    model = YOLO("yolo11n-pose.pt")
+    model = YOLO(_YOLO_WEIGHTS)
     model.to(select_device(device))
 
     overlay_saved = False

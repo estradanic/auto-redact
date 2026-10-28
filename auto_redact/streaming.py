@@ -23,14 +23,16 @@ output until they are classified, the same as the staged worst case.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import queue
+import subprocess
 import shutil
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from pathlib import Path
 from typing import Any
 
@@ -311,7 +313,17 @@ class _Decider:
         self.frontier.decide(track)
 
     def _snapshot(self, track: _Track) -> str | None:
-        if track.best_box is None or track.best_crop is None:
+        if track.best_box is None:
+            return None
+        if track.best_crop is None and track.tl.best_frame is not None:
+            try:
+                for _fi, frame in iter_frames(self.info.path, start=track.tl.best_frame,
+                                             stop=track.tl.best_frame + 1):
+                    track.best_crop = crop_snapshot(frame, track.best_box, self.padding).copy()
+                    break
+            except Exception:
+                track.best_crop = None
+        if track.best_crop is None:
             return None
         box, crop, tl = track.best_box, track.best_crop, track.tl
         window = _padded_crop_window(box, self.w, self.h, self.padding)
@@ -356,11 +368,14 @@ class _Decider:
 class _SelectiveShipper(threading.Thread):
     """Copies or re-encodes each GOP as soon as it is final."""
 
-    def __init__(self, frontier, video, info, keyframes, work_dir, crf, preset, encoder):
+    def __init__(self, frontier, video, info, keyframes, work_dir, crf, preset, encoder,
+                 growing_ts=None, shipped_gops=None):
         super().__init__(name="ship", daemon=True)
         self.frontier, self.video, self.info = frontier, video, info
         self.keyframes, self.work_dir = keyframes, work_dir
         self.crf, self.preset, self.encoder = crf, preset, encoder
+        self.growing_ts = Path(growing_ts) if growing_ts is not None else (work_dir / "growing.ts")
+        self.shipped_gops = set(shipped_gops or ())
         bounds = sorted({0, info.frame_count, *keyframes})
         self.gops = [
             (a, b) for a, b in zip(bounds, bounds[1:]) if b > a
@@ -370,7 +385,7 @@ class _SelectiveShipper(threading.Thread):
 
     def run(self) -> None:
         try:
-            taken: set[int] = set()
+            taken: set[int] = set(self.shipped_gops)
             while len(taken) < len(self.gops):
                 ready = self.frontier.ready_ranges(self.gops, taken)
                 for run in _consecutive(ready):
@@ -383,7 +398,7 @@ class _SelectiveShipper(threading.Thread):
             self.frontier.fail(error)
 
     def _ship(self, edited: bool, lo: int, hi: int, boxes) -> None:
-        part = self.work_dir / f"part_{lo:08d}.mp4"
+        part = self.work_dir / f"part_{lo:08d}.ts"
         segment = Segment(lo, hi, edited)
         with telemetry.timed("ship.encode" if edited else "ship.copy"):
             if edited:
@@ -397,6 +412,16 @@ class _SelectiveShipper(threading.Thread):
                 )
             else:
                 copy_segment(self.video, part, self.keyframes, segment)
+        # Append this GOP to the growing TS file for mid-run playability.
+        try:
+            with open(self.growing_ts, "ab") as _f:
+                _f.write(part.read_bytes())
+        except Exception:
+            logger.exception("failed to append %s to growing ts", part)
+        try:
+            part.unlink(missing_ok=True)
+        except Exception:
+            pass
         self.parts.append((lo, part))
         self.shipped_frames += hi - lo
 
@@ -458,12 +483,15 @@ def run_pipeline_streaming(
     meta_path=None,
     thumbs_dir=None,
     force=False,
+    resume=True,
+    checkpoint_interval: int = 500,
     progress=lambda message: None,
     bar=lambda desc, **_: contextlib.nullcontext(),
     tracker: PersonTracker | None = None,
     detector: PersonDetector | None = None,
 ) -> dict:
     cfg = config if config is not None else Config()
+    cfg = dc_replace(cfg, resume=cfg.resume and bool(resume))
     track_cfg, snapshot_cfg, classify_cfg, render_cfg = (
         cfg.track, cfg.snapshot, cfg.classify, cfg.render
     )
@@ -495,27 +523,25 @@ def run_pipeline_streaming(
     classify_key = cache.classify_key(snapshot_key, prompt, classify_cfg)
     info = probe_video(video)
 
-    # With tracking and snapshots already cached there is nothing left to
-    # overlap; the staged pipeline reuses them and only redoes what changed.
-    if (
-        not force
-        and meta_file.is_file()
-        and stages.matches("track", track_key)
-        and stages.matches("snapshot", snapshot_key)
-    ):
+    # Reuse any tracking that is already cached (and everything downstream that
+    # the staged pipeline can reuse too) instead of redoing it. Only the track
+    # stage has to match: the staged pipeline redoes snapshot/classify/render
+    # for whatever is missing or stale, and adopts pre-cache metadata once.
+    legacy = not stages.path.exists()
+    track_cached = legacy or stages.matches("track", track_key)
+    if not force and meta_file.is_file() and track_cached:
         try:
             cached = load_meta(meta_file)
         except MetaError:
             cached = None
-        if cached is not None and cached.tracklets and snapshots_done(cached):
-            progress("[stream] tracking and snapshots cached; using the staged pipeline")
+        if cached is not None and cached.tracklets:
+            progress("[stream] tracking cached; using the staged pipeline")
             summary = run_pipeline(
                 video, prompt, out, cfg, meta_path=meta_file, thumbs_dir=thumbs,
                 force=False, progress=progress, bar=bar,
             )
             return {"out": summary.out, "meta_path": summary.meta_path,
                     "tracklets": summary.tracklets, "redacted": summary.redacted}
-
     stages.begin("track", track_key)
     w, h = info.width, info.height
     thumbs.mkdir(parents=True, exist_ok=True)
@@ -533,6 +559,13 @@ def run_pipeline_streaming(
 
     # Rendering mode.
     work_dir = Path(tempfile.mkdtemp(prefix="auto-redact-stream-"))
+    growing_ts = out.with_suffix(".ts")
+    _resume_ckpt = resume and not force and meta_file.with_name(meta_file.name + ".stream.track.ckpt.json").is_file()
+    if not _resume_ckpt:
+        try:
+            growing_ts.unlink(missing_ok=True)
+        except Exception:
+            pass
     keyframes: dict[int, int] = {}
     if selective and not orphans:
         keyframes, open_gop = keyframe_table(video)
@@ -545,7 +578,8 @@ def run_pipeline_streaming(
     shipper = None
     if not orphans:
         shipper = (
-            _SelectiveShipper(frontier, video, info, keyframes, work_dir, crf, preset, encoder)
+            _SelectiveShipper(frontier, video, info, keyframes, work_dir, crf, preset, encoder,
+                              growing_ts=growing_ts)
             if keyframes else _FullShipper(frontier, video, out, info, crf, preset, encoder)
         )
     telemetry.note("stream.render_mode", "none (orphans)" if shipper is None else
@@ -565,14 +599,113 @@ def run_pipeline_streaming(
     # so a tracklet silent for longer than that is complete.
     close_gap = (tracker.lost_buffer + 2) * sample_rate
 
+    ckpt_path = meta_file.with_name(meta_file.name + ".stream.track.ckpt.json")
     tracks: list[_Track] = []
-    open_tracks: dict[int, _Track] = {}
     cuts: list[int] = []
     next_uid = 1
+    closed_tracks: list[_Track] = []
+    shipped_gops: set[int] = set()
+    prev_hist = None
+    start_frame = 0
+
+    # Restore from checkpoint when possible.
+    if resume and not force and ckpt_path.is_file():
+        try:
+            data = json.loads(ckpt_path.read_text(encoding="utf-8"))
+            if data.get("video") == str(video.resolve()):
+                start_frame = int(data.get("last_frame", -1)) + 1
+                next_uid = int(data.get("next_uid", 1))
+                cuts = list(data.get("cuts", []))
+                prev_hist_raw = data.get("prev_hist")
+                if prev_hist_raw is not None:
+                    prev_hist = np.asarray(prev_hist_raw, dtype=float)
+                shipped_gops = set(data.get("shipped_gops", []))
+                for d in data.get("closed", []):
+                    tl = Tracklet(
+                        track_id=d["uid"],
+                        frames=list(d["frames"]),
+                        boxes=[list(b) for b in d["boxes"]],
+                        keypoints=[list(k) for k in d["keypoints"]],
+                    )
+                    tl.best_frame = d.get("best_frame")
+                    tl.best_snapshot_path = d.get("best_snapshot_path")
+                    tl.redact = d.get("redact")
+                    tl.score = d.get("score")
+                    tl.detail = d.get("detail")
+                    tl.isolated_track_ids = list(d.get("isolated_track_ids") or [])
+                    tr = _Track(
+                        uid=d["uid"],
+                        tracker_id=d["tracker_id"],
+                        tl=tl,
+                        closed=True,
+                        best_score=d.get("best_score", -1.0),
+                        best_box=(None if d.get("best_box") is None else list(d["best_box"])),
+                        best_others=[(oid, list(ob)) for oid, ob in (d.get("best_others") or [])],
+                    )
+                    tracks.append(tr)
+                    closed_tracks.append(tr)
+                    if tr.tl.redact is None:
+                        frontier.add(tr)
+                        decider.submit(tr)
+                    else:
+                        if tr.tl.effective_redact is True:
+                            frontier.redacted.append(tr.tl)
+        except (OSError, ValueError, KeyError, TypeError):
+            start_frame = 0
+            shipped_gops = set()
+
+    if not resume or force:
+        try:
+            ckpt_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            growing_ts.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if shipper is not None:
+        shipper.shipped_gops = shipped_gops
+
+    open_tracks: dict[int, _Track] = {}
 
     def close(track: _Track) -> None:
         track.closed = True
+        closed_tracks.append(track)
         decider.submit(track)
+
+    def save_ckpt(last_frame: int) -> None:
+        try:
+            data = {
+                "video": str(video.resolve()),
+                "last_frame": last_frame,
+                "next_uid": next_uid,
+                "cuts": cuts,
+                "prev_hist": None if prev_hist is None else prev_hist.tolist(),
+                "shipped_gops": sorted(shipped_gops),
+                "closed": [
+                    {
+                        "uid": t.uid,
+                        "tracker_id": t.tracker_id,
+                        "frames": list(t.tl.frames),
+                        "boxes": [list(b) for b in t.tl.boxes],
+                        "keypoints": [list(k) for k in t.tl.keypoints],
+                        "best_frame": t.tl.best_frame,
+                        "best_box": (None if t.best_box is None else list(t.best_box)),
+                        "best_score": t.best_score,
+                        "best_others": [(oid, list(ob)) for oid, ob in t.best_others],
+                        "redact": t.tl.redact,
+                        "score": t.tl.score,
+                        "detail": t.tl.detail,
+                        "best_snapshot_path": t.tl.best_snapshot_path,
+                        "isolated_track_ids": list(t.tl.isolated_track_ids),
+                    }
+                    for t in closed_tracks
+                ],
+            }
+            ckpt_path.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
 
     abort = threading.Event()
     frames_q: queue.Queue = queue.Queue(maxsize=6)
@@ -620,6 +753,11 @@ def run_pipeline_streaming(
                 frame_idx, frame, cut = item
                 if frontier.fatal is not None:
                     raise frontier.fatal
+                if frame_idx < start_frame:
+                    frontier.advance(frame_idx + 1)
+                    if frame_idx % 8 == 0:
+                        report(frame_idx)
+                    continue
                 last_idx = frame_idx
                 if cut:
                     cuts.append(frame_idx)
@@ -671,6 +809,8 @@ def run_pipeline_streaming(
                         del open_tracks[tid]
                         close(track)
                 frontier.advance(frame_idx + 1)
+                if checkpoint_interval > 0 and frame_idx % checkpoint_interval == 0:
+                    save_ckpt(frame_idx)
                 if frame_idx % 8 == 0:
                     report(frame_idx)
 
@@ -678,8 +818,35 @@ def run_pipeline_streaming(
                 close(track)
             open_tracks.clear()
             frontier.finish_tracking()
+            save_ckpt(max(last_idx, 0))
             report(max(last_idx, 0))
             decoder.join()
+
+            # Tracking is finished: YOLO is no longer needed, so drop it and
+            # try to promote any SigLIP instance that fell back to the CPU onto
+            # the GPU now that (hopefully) enough VRAM is free. This speeds up
+            # the classification catch-up that follows.
+            try:
+                closer = getattr(tracker, "close", None)
+                if callable(closer):
+                    closer()
+            except Exception:
+                logger.debug("tracker close failed", exc_info=True)
+            tracker = None
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                for _clf in (getattr(decider, "clf", None), getattr(decider, "pre_clf", None)):
+                    promote = getattr(_clf, "promote_to_gpu", None)
+                    if callable(promote):
+                        promote()
+            except Exception:
+                logger.debug("siglip promotion failed", exc_info=True)
 
             if shipper is not None:
                 while shipper.is_alive():
@@ -694,8 +861,11 @@ def run_pipeline_streaming(
         frontier.fail(error)
         decider.pool.shutdown(wait=False, cancel_futures=True)
         shutil.rmtree(work_dir, ignore_errors=True)
+        try:
+            save_ckpt(max(last_idx, 0))
+        except Exception:
+            pass
         raise
-
     # Final metadata, numbered exactly as the staged pipeline would.
     meta = _build_meta(video, info, tracks, cuts if scene_cuts else [], thumbs, scene_cuts)
 
@@ -703,6 +873,14 @@ def run_pipeline_streaming(
     if undecided and classify_cfg.on_undecided == "error":
         shutil.rmtree(work_dir, ignore_errors=True)
         out.unlink(missing_ok=True)
+        try:
+            growing_ts.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            ckpt_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         save_meta(meta_file, meta)
         raise ClassifyError(
             f"{len(undecided)} tracklet(s) could not be classified: {undecided} "
@@ -712,13 +890,23 @@ def run_pipeline_streaming(
     if orphans:
         meta = _finish_with_orphans(meta, video, out, meta_file, thumbs, prompt, clf, cfg)
     elif keyframes:
-        parts = [p for _, p in sorted(shipper.parts)]
-        joined = work_dir / "joined.mp4"
         with telemetry.timed("ship.finalize"):
-            concat_video(parts, joined)
-            mux_audio(joined, video, out)
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-i", str(growing_ts), "-i", str(video),
+                 "-map", "0:v:0", "-map", "1:a?", "-c", "copy",
+                 "-movflags", "+faststart", str(out)],
+                check=True,
+            )
+            try:
+                growing_ts.unlink(missing_ok=True)
+            except Exception:
+                pass
     shutil.rmtree(work_dir, ignore_errors=True)
-
+    try:
+        ckpt_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+ 
     save_meta(meta_file, meta)
     stages.record("track", track_key)
     stages.record("snapshot", snapshot_key)

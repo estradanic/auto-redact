@@ -365,7 +365,8 @@ def _cmd_track(args: argparse.Namespace) -> int:
     stages.begin("track", key)
     with progress_bar("track") as on_progress:
         meta = build_tracklets(
-            args.video, cfg.track, on_progress=on_progress, meta_path=args.meta
+            args.video, cfg.track, on_progress=on_progress, meta_path=args.meta,
+            resume=cfg.resume,
         )
     if cfg.track.orphans:
         with progress_bar("orphan") as orphan_progress:

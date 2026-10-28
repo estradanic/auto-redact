@@ -238,15 +238,24 @@ def make_prefilter(config: ClassifyConfig) -> Classifier | None:
     """The SigLIP pre-filter, or None when ``config.prefilter`` is ``none``."""
     if config.classifier != "vlm" or config.prefilter not in ("negatives", "positives"):
         return None
+    import inspect
+
     from .siglip import SiglipClassifier
 
-    return SiglipClassifier(
-        config.prefilter_model or DEFAULT_SIGLIP_MODEL,
+    model = config.prefilter_model or DEFAULT_SIGLIP_MODEL
+    threshold = (
         config.prefilter_threshold
         if config.prefilter_threshold is not None
-        else ClassifyConfig.threshold,
-        config.prefilter_device,
+        else ClassifyConfig.threshold
     )
+    kwargs = {}
+    try:
+        params = inspect.signature(SiglipClassifier.__init__).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "vram_reserve_mb" in params:
+        kwargs["vram_reserve_mb"] = 2500
+    return SiglipClassifier(model, threshold, config.prefilter_device, **kwargs)
 
 
 def classify_snapshots(
