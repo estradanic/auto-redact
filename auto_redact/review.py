@@ -302,7 +302,7 @@ class Review:
         with self.lock:
             if self._render["state"] == "running":
                 raise ReviewError("a render is already running")
-            self._render = {"state": "running", "done": 0, "total": 0, "message": "", "out": str(self.out_path)}
+            self._render = {"state": "running", "done": 0, "total": self.meta.video.frames or 1, "message": "", "out": str(self.out_path)}
 
         def progress(done: int, total: int) -> None:
             self._render.update(done=done, total=total)
@@ -310,6 +310,7 @@ class Review:
         def work() -> None:
             try:
                 render_redacted(self.meta, self.out_path, config, on_progress=progress)
+                progress(self.meta.video.frames, self.meta.video.frames or 1)
                 self._render.update(state="done", message=f"wrote {self.out_path}")
             except Exception as error:  # surfaced to the page, not swallowed
                 self._render.update(state="error", message=f"{type(error).__name__}: {error}")

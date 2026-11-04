@@ -490,6 +490,16 @@ def test_select_snapshots_can_skip_contact_sheet(
     assert (thumbs / "track_1.jpg").is_file()
 
 
+def test_select_snapshots_reports_progress(two_person_meta: Metadata, tmp_path: Path) -> None:
+    thumbs = tmp_path / "thumbs"
+    seen = []
+
+    select_snapshots(two_person_meta, thumbs_dir=thumbs, on_progress=lambda d, t: seen.append((d, t)))
+
+    assert seen and seen[-1] == (seen[-1][1], seen[-1][1])
+    assert seen[-1][0] == seen[-1][1]
+
+
 def test_select_snapshots_without_tracklets_writes_nothing(
     clip: Path, tmp_path: Path
 ) -> None:

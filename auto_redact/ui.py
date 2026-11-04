@@ -34,11 +34,22 @@ def progress_bar(desc: str, unit: str | None = None, position: int = 0) -> Itera
     )
 
     def update(done: int, total: int) -> None:
-        bar.total = total
+        # Keep the bar's total in sync first so the percentage and the
+        # "done/total" counter agree even on the final update.
+        if total is not None and total >= 0:
+            bar.total = total
         # update() maintains tqdm's smoothed rate; setting bar.n directly
         # leaves it as a cumulative average that includes startup time.
-        bar.update(done - bar.n)
-
+        delta = done - bar.n
+        if delta >= 0:
+            bar.update(delta)
+        else:
+            # A late/out-of-order report must not leave the bar behind.
+            bar.n = done
+        try:
+            bar.refresh()
+        except Exception:
+            pass
     try:
         yield update
     finally:

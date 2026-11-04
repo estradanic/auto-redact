@@ -361,4 +361,6 @@ def add_orphan_tracklets(
         meta.tracklets.append(tracklet)
         next_id += 1
         added += 1
+    if on_progress is not None and total_frames and done < total_frames:
+        on_progress(total_frames, total_frames)
     return meta

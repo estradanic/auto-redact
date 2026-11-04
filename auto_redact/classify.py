@@ -347,6 +347,7 @@ def classify_snapshots(
 
     pending = [t for t in meta.tracklets if t.redact is None]
     already_done = total - len(pending)
+    total_pf = len(pending)
 
     def apply(tracklet, decision: Decision) -> None:
         decision = resolve_undecided(decision, cfg.on_undecided)
@@ -477,6 +478,10 @@ def classify_snapshots(
                 if on_progress is not None:
                     on_progress(completed, total)
                 _maybe_save()
+    if on_prefilter_progress is not None and siglip is not None and pending:
+        on_prefilter_progress(total_pf, total_pf)
+    if on_progress is not None and completed < total:
+        on_progress(total, total)
     if ckpt_path is not None:
         try:
             ckpt_path.unlink(missing_ok=True)

@@ -95,6 +95,8 @@ def render_selective(
             parts.append(part)
             if on_progress is not None:
                 on_progress(segment.end, probe.frame_count)
+        if on_progress is not None:
+            on_progress(probe.frame_count, probe.frame_count)
         joined = tmpdir / "joined.mp4"
         concat_video(parts, joined)
         mux_audio(joined, source, out)

@@ -219,7 +219,8 @@ def encode_full(
             stdin.write(frame)
             if on_progress is not None:
                 on_progress(frame_idx + 1, probe.frame_count)
-
+    if on_progress is not None and probe.frame_count > 0:
+        on_progress(probe.frame_count, probe.frame_count)
 
 def run_ffmpeg(arguments: list[str]) -> None:
     proc = subprocess.run(

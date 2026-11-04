@@ -280,6 +280,21 @@ def test_redaction_boxes_rejects_bad_stability_args(red_clip: Path) -> None:
 # --- render_redacted (integration) ------------------------------------------
 
 
+def test_render_reports_progress(red_clip: Path, tmp_path: Path) -> None:
+    meta = make_meta(
+        red_clip,
+        tracklets=[
+            make_tracklet(1, range(0, 5), [[10, 10, 50, 50]] * 5, redact=True),
+        ],
+    )
+    from auto_redact.render import render_redacted
+    from auto_redact.config import RenderConfig
+
+    seen = []
+    render_redacted(meta, tmp_path / "out.mp4", RenderConfig(), on_progress=lambda d, t: seen.append((d, t)))
+    assert seen and seen[-1][0] == seen[-1][1]
+
+
 def test_render_blacks_out_redacted_boxes(red_clip: Path, tmp_path: Path) -> None:
     frames = list(range(10))  # redact only the first second
     meta = make_meta(
