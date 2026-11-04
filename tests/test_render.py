@@ -424,6 +424,45 @@ def test_build_segments_aligns_to_keyframes_and_merges() -> None:
     ]
 
 
+def make_hevc_clip(path: Path) -> Path:
+    """Like ``gop_red_clip`` but HEVC (x265), the way many releases are encoded."""
+    source = "color=c=red:size=64x48:rate=25:duration=2"
+    subprocess.run(
+        [FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i", source,
+         "-c:v", "libx265", "-x265-params", "keyint=10:min-keyint=10:log-level=error",
+         "-pix_fmt", "yuv420p", str(path)],
+        check=True,
+    )
+    return path
+
+
+def _has_libx265() -> bool:
+    proc = subprocess.run([FFMPEG, "-hide_banner", "-encoders"], capture_output=True, text=True)
+    return "libx265" in proc.stdout
+
+
+@pytest.mark.skipif(not (FFMPEG and _has_libx265()), reason="ffmpeg lacks libx265")
+def test_selective_is_not_used_for_non_h264_sources(tmp_path: Path) -> None:
+    """Copied HEVC chunks spliced with re-encoded H.264 chunks cannot be decoded
+    past the first redaction (video freezes while audio plays on), so a non-H.264
+    source must fall back to a full re-encode."""
+    hevc = make_hevc_clip(tmp_path / "hevc.mp4")
+    assert keyframe_table(hevc) == ({}, False)
+
+    redacted = [10, 11, 12]
+    meta = make_meta(
+        hevc, [make_tracklet(1, redacted, [[10, 10, 30, 30]] * len(redacted), True)]
+    )
+    out = render_redacted(meta, tmp_path / "sel.mp4", selective=True, min_track_frames=1)
+
+    video = [s for s in probe_streams(out) if s["codec_type"] == "video"]
+    assert [s["codec_name"] for s in video] == ["h264"]
+    rendered = dict(iter_frames(out))
+    assert len(rendered) == 50
+    assert rendered[11][12:28, 12:28].max() < 30
+    assert rendered[40].max() > 100  # still decodable after the edited GOP
+
+
 def test_selective_blacks_out_redactions_and_copies_rest(
     gop_red_clip: Path, tmp_path: Path
 ) -> None:

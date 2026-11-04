@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Callable
 
 import av
+from av.bitstream import BitStreamFilterContext
 
 from .encode import (
     concat_video,
@@ -124,8 +125,18 @@ def keyframe_table(source: Path) -> tuple[dict[int, int], bool]:
     frame index is derived relative to the first keyframe.
 
     Returns ``(table, is_open_gop)``. ``table`` is ``{}`` when the container
-    reports no keyframes or the stream lacks timing information.
+    reports no keyframes or the stream lacks timing information, or when the
+    source is not 8-bit H.264: re-encoded chunks are 8-bit H.264, and splicing
+    them between copied chunks of another codec (e.g. HEVC) yields a stream
+    no player can decode past the first redaction.
     """
+    try:
+        with av.open(str(source)) as container:
+            codec = container.streams.video[0].codec_context
+            if codec.name != "h264" or codec.pix_fmt != "yuv420p":
+                return {}, False
+    except Exception:
+        return {}, False
     proc = subprocess.run(
         [
             "ffprobe",
@@ -216,6 +227,14 @@ def copy_segment(
         stream = input_container.streams.video[0]
         with av.open(str(part), "w") as output_container:
             output_stream = output_container.add_stream_from_template(stream)
+            # In MPEG-TS the muxer inserts SPS/PPS after an SEI that opens the
+            # source's first packet (x264's version SEI), and VLC then waits
+            # forever for SPS/PPS. Dropping SEI keeps the growing .ts playable.
+            sei_filter = (
+                BitStreamFilterContext("h264_mp4toannexb,filter_units=remove_types=6", stream)
+                if part.suffix == ".ts" and stream.codec_context.name == "h264"
+                else None
+            )
             try:
                 # Jump to the keyframe at ``low`` instead of demuxing from the start.
                 input_container.seek(low, stream=stream, backward=True, any_frame=False)
@@ -229,7 +248,9 @@ def copy_segment(
                 if high is not None and packet.pts >= high:
                     break
                 packet.stream = output_stream
-                output_container.mux(packet)
+                for out_packet in (sei_filter.filter(packet) if sei_filter else [packet]):
+                    out_packet.stream = output_stream
+                    output_container.mux(out_packet)
 
 
 def encode_segment(
@@ -253,6 +274,7 @@ def encode_segment(
         *raw_input_args(probe),
         *encoder.codec_args(crf, preset),
         "-pix_fmt", "yuv420p",
+        "-output_ts_offset", f"{segment.start / probe.fps:.6f}",
         str(part),
     ]
     with ffmpeg_stdin(command, source) as stdin, av.open(str(source)) as container:
