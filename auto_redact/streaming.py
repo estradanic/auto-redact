@@ -42,7 +42,14 @@ from PIL import Image
 
 from . import telemetry
 from . import cache
-from .classify import ClassifyError, Decision, make_classifier, make_prefilter, resolve_undecided
+from .classify import (
+    ClassifyError,
+    Decision,
+    make_classifier,
+    make_prefilter,
+    record_decision_metrics,
+    resolve_undecided,
+)
 from .config import Config
 from .encode import (
     check_crf,
@@ -59,8 +66,15 @@ from .boxes import redaction_boxes
 from .pipeline import run_pipeline, snapshots_done
 from .workspace import resolve_run_paths
 from .render import render_redacted
-from .segments import Segment, copy_segment, encode_segment, keyframe_table
-from .scene import _frame_hist
+from .segments import (
+    Segment,
+    add_audio_to_part,
+    copy_segment,
+    encode_segment,
+    keyframe_table,
+)
+from .scene import rgb_frame_hist
+from .vlc import LivePlayer, play_file
 from .snapshot import (
     CONTACT_SHEET_CELL,
     JPEG_QUALITY,
@@ -73,10 +87,19 @@ from .snapshot import (
 )
 from .detectors import make_detector, make_tracker
 from .protocols import PersonDetector, PersonTracker
+from .views import MAX_LOOKBACK, ViewTracker
 
 logger = logging.getLogger(__name__)
 
 _LAZY_CHUNK = 128  # frames per box computation in full re-encode mode
+
+
+def _write_crop(array: np.ndarray, path: Path) -> None:
+    """Save a checkpoint crop (runs on the crop-writer thread)."""
+    try:
+        Image.fromarray(array).save(path, compress_level=1)
+    except Exception:
+        logger.warning("could not save checkpoint crop %s", path, exc_info=True)
 
 
 @dataclass
@@ -92,6 +115,16 @@ class _Track:
     best_crop: np.ndarray | None = None
     best_others: list[tuple[int, list[float]]] = field(default_factory=list)
     thumb: Image.Image | None = None
+    # view_split: tracks cut from one tracker id share a ViewTracker; a short
+    # tail inherits ``parent``'s verdict (it is dropped by the renderer, and
+    # too short for a snapshot of its own).
+    views: ViewTracker | None = None
+    parent: "_Track | None" = None
+    # Scored observations not yet considered for the best snapshot: a view
+    # change is only noticed a few frames after it starts, and those frames
+    # must be able to move to the new track instead of winning on the old one.
+    pending: list = field(default_factory=list)
+    decided: threading.Event = field(default_factory=threading.Event)
 
     @property
     def first(self) -> int:
@@ -173,15 +206,19 @@ class _Frontier:
                 raise self.fatal
 
     def ready_ranges(self, ranges: list[tuple[int, int]], taken: set[int]) -> list[int]:
-        """Block until some untaken range is final; return their indexes."""
+        """Block until the next untaken range is final; return its index and
+        any consecutive final ranges after it, so output stays in order."""
         with self.cv:
             while True:
                 if self.fatal is not None:
                     raise self.fatal
-                ready = [
-                    i for i, (lo, hi) in enumerate(ranges)
-                    if i not in taken and self._final_locked(lo, hi)
-                ]
+                ready = []
+                for i, (lo, hi) in enumerate(ranges):
+                    if i in taken:
+                        continue
+                    if not self._final_locked(lo, hi):
+                        break
+                    ready.append(i)
                 if ready or len(taken) == len(ranges):
                     return ready
                 self.cv.wait(0.5)
@@ -241,7 +278,7 @@ def _decode_thread(video: Path, out: queue.Queue, abort: threading.Event,
         for idx, frame in iter_frames(video, sample_rate=1, threads=os.cpu_count()):
             cut = False
             if scene_cuts:
-                hist = _frame_hist(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                hist = rgb_frame_hist(frame)
                 if prev is not None:
                     dist = float(cv2.compareHist(prev, hist, cv2.HISTCMP_BHATTACHARYYA))
                     cut = dist >= threshold
@@ -259,10 +296,12 @@ class _Decider:
     def __init__(self, *, frontier, info, thumbs, prompt, padding, isolate,
                  sub_isolate, closeup_area_fraction, same_person_iou,
                  isolate_dilate, classifier, prefilter_clf, prefilter,
-                 workers, detector=None, on_undecided="redact") -> None:
+                 workers, detector=None, on_undecided="redact", view_min_frames=0) -> None:
         self.frontier = frontier
+        self.view_min_frames = view_min_frames
         self.on_undecided = on_undecided
         self.w, self.h = info.width, info.height
+        self.video = info.path
         self.thumbs = thumbs
         self.prompt = prompt
         self.padding = padding
@@ -299,6 +338,12 @@ class _Decider:
             logger.warning("track %s: decision failed (%s: %s)", track.uid, type(error).__name__, error)
             logger.debug("decision traceback", exc_info=True)
             decision = Decision(None, None, f"error: {error}")
+        try:
+            self._finish(track, decision)
+        finally:
+            track.decided.set()
+
+    def _finish(self, track: _Track, decision: Decision) -> None:
         decision = resolve_undecided(decision, self.on_undecided)
         tl = track.tl
         tl.redact, tl.score = decision.redact, decision.score
@@ -317,11 +362,13 @@ class _Decider:
             return None
         if track.best_crop is None and track.tl.best_frame is not None:
             try:
-                for _fi, frame in iter_frames(self.info.path, start=track.tl.best_frame,
+                for _fi, frame in iter_frames(self.video, start=track.tl.best_frame,
                                              stop=track.tl.best_frame + 1):
                     track.best_crop = crop_snapshot(frame, track.best_box, self.padding).copy()
                     break
             except Exception:
+                logger.warning("track %s: could not re-read its snapshot frame", track.uid,
+                               exc_info=True)
                 track.best_crop = None
         if track.best_crop is None:
             return None
@@ -347,9 +394,17 @@ class _Decider:
         return str(path)
 
     def _decide(self, track: _Track) -> Decision:
+        parent = track.parent
+        if parent is not None and len(track.tl.frames) < self.view_min_frames:
+            # Submitted after its parent, so the parent is already running.
+            parent.decided.wait()
+            tl = parent.tl
+            telemetry.count("view_split", "short_tails_inherited")
+            return Decision(tl.redact, tl.score, f"inherited from track {tl.track_id}: {tl.detail or ''}".strip())
         path = self._snapshot(track)
         if path is None:
             return Decision(None, None, "no usable snapshot")
+        early = None
         if self.pre_clf is not None:
             try:
                 early = self.pre_clf.classify(path, self.prompt)
@@ -358,8 +413,11 @@ class _Decider:
                 return Decision(None, None, "siglip error")
             needs_vlm = early.redact is (False if self.prefilter == "negatives" else True)
             if not needs_vlm:
+                record_decision_metrics(track.uid, early, early, self.prefilter)
                 return early
-        return self.clf.classify(path, self.prompt)
+        final = self.clf.classify(path, self.prompt)
+        record_decision_metrics(track.uid, early, final, self.prefilter)
+        return final
 
     def drain(self) -> None:
         self.pool.shutdown(wait=True)
@@ -385,7 +443,8 @@ class _SelectiveShipper(threading.Thread):
 
     def run(self) -> None:
         try:
-            taken: set[int] = set(self.shipped_gops)
+            # Updated in place: the checkpoint records it for resuming.
+            taken = self.shipped_gops
             while len(taken) < len(self.gops):
                 ready = self.frontier.ready_ranges(self.gops, taken)
                 for run in _consecutive(ready):
@@ -398,6 +457,7 @@ class _SelectiveShipper(threading.Thread):
             self.frontier.fail(error)
 
     def _ship(self, edited: bool, lo: int, hi: int, boxes) -> None:
+        video_part = self.work_dir / f"video_{lo:08d}.ts"
         part = self.work_dir / f"part_{lo:08d}.ts"
         segment = Segment(lo, hi, edited)
         with telemetry.timed("ship.encode" if edited else "ship.copy"):
@@ -406,12 +466,19 @@ class _SelectiveShipper(threading.Thread):
                 self.encoder, self.preset = run_with_fallback(
                     self.encoder, self.preset,
                     lambda encoder, preset: encode_segment(
-                        self.video, part, boxes, self.keyframes, segment,
+                        self.video, video_part, boxes, self.keyframes, segment,
                         self.info, self.crf, preset, encoder,
                     ),
                 )
             else:
-                copy_segment(self.video, part, self.keyframes, segment)
+                copy_segment(self.video, video_part, self.keyframes, segment)
+        with telemetry.timed("ship.audio"):
+            if self.info.has_audio and add_audio_to_part(
+                video_part, part, self.video, self.keyframes, segment, retime=edited
+            ):
+                video_part.unlink(missing_ok=True)
+            else:
+                video_part.replace(part)
         # Append this GOP to the growing TS file for mid-run playability.
         try:
             with open(self.growing_ts, "ab") as _f:
@@ -451,9 +518,10 @@ def _split_by_edit(run, gops, boxes):
 class _FullShipper(threading.Thread):
     """Streams every frame through one encoder, painting as boxes finalize."""
 
-    def __init__(self, frontier, video, out, info, crf, preset, encoder):
+    def __init__(self, frontier, video, out, info, crf, preset, encoder, live=None):
         super().__init__(name="ship", daemon=True)
         self.args = (video, out, info, crf, preset, encoder)
+        self.live = live
         self.boxes = _LazyBoxes(frontier, info.frame_count)
         self.frontier = frontier
 
@@ -467,7 +535,7 @@ class _FullShipper(threading.Thread):
             run_with_fallback(
                 encoder, preset,
                 lambda encoder, preset: encode_full(
-                    video, out, self.boxes, info, crf, preset, encoder
+                    video, out, self.boxes, info, crf, preset, encoder, live=self.live
                 ),
             )
         except BaseException as error:
@@ -489,6 +557,7 @@ def run_pipeline_streaming(
     bar=lambda desc, **_: contextlib.nullcontext(),
     tracker: PersonTracker | None = None,
     detector: PersonDetector | None = None,
+    vlc: bool = False,
 ) -> dict:
     cfg = config if config is not None else Config()
     cfg = dc_replace(cfg, resume=cfg.resume and bool(resume))
@@ -498,6 +567,7 @@ def run_pipeline_streaming(
     sample_rate = track_cfg.stride
     orphans = track_cfg.orphans
     scene_cuts, scene_cut_threshold = track_cfg.scene_cuts, track_cfg.scene_cut_threshold
+    view_split = track_cfg.view_split
     padding, isolate, sub_isolate = snapshot_cfg.padding, snapshot_cfg.isolate, snapshot_cfg.sub_isolate
     closeup_area_fraction = snapshot_cfg.closeup_area_fraction
     same_person_iou, isolate_dilate = snapshot_cfg.same_person_iou, snapshot_cfg.isolate_dilate
@@ -540,6 +610,9 @@ def run_pipeline_streaming(
                 video, prompt, out, cfg, meta_path=meta_file, thumbs_dir=thumbs,
                 force=False, progress=progress, bar=bar,
             )
+            if vlc:
+                progress("[vlc] nothing to stream live (tracking was cached); opening the result")
+                play_file(summary.out)
             return {"out": summary.out, "meta_path": summary.meta_path,
                     "tracklets": summary.tracklets, "redacted": summary.redacted}
     stages.begin("track", track_key)
@@ -576,14 +649,21 @@ def run_pipeline_streaming(
         max_gap, smooth_window, bridge_iou, min_track_frames,
     )
     shipper = None
+    live_ts = work_dir / "live.ts" if vlc and not keyframes else None
     if not orphans:
         shipper = (
             _SelectiveShipper(frontier, video, info, keyframes, work_dir, crf, preset, encoder,
                               growing_ts=growing_ts)
-            if keyframes else _FullShipper(frontier, video, out, info, crf, preset, encoder)
+            if keyframes else _FullShipper(frontier, video, out, info, crf, preset, encoder,
+                                           live=live_ts)
         )
     telemetry.note("stream.render_mode", "none (orphans)" if shipper is None else
                    "selective" if keyframes else "full")
+
+    player = None
+    if vlc and shipper is not None:
+        player = LivePlayer(growing_ts if keyframes else live_ts, progress)
+        player.start()
 
     decider = _Decider(
         frontier=frontier, info=info, thumbs=thumbs, prompt=prompt.strip(), padding=padding,
@@ -591,6 +671,7 @@ def run_pipeline_streaming(
         same_person_iou=same_person_iou, isolate_dilate=isolate_dilate, classifier=clf,
         prefilter_clf=pre_clf, prefilter=prefilter, workers=classify_workers,
         detector=detector, on_undecided=classify_cfg.on_undecided,
+        view_min_frames=track_cfg.view_min_frames if track_cfg.view_split else 0,
     )
 
     if tracker is None:
@@ -600,6 +681,30 @@ def run_pipeline_streaming(
     close_gap = (tracker.lost_buffer + 2) * sample_rate
 
     ckpt_path = meta_file.with_name(meta_file.name + ".stream.track.ckpt.json")
+    # Best crops of closed tracklets, kept so a resumed run can classify them
+    # without seeking back into the video.
+    crops_dir = ckpt_path.with_name(ckpt_path.name + ".crops")
+    # PNG-compressing a crop takes 17-66 ms, so it is done off the tracking
+    # thread. Anything that reads the crops (a checkpoint, cleanup) waits first.
+    crop_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="crop-save")
+    crop_writes: list = []
+
+    def flush_crops() -> None:
+        for write in crop_writes:
+            write.result()
+        crop_writes.clear()
+
+    def stop_crop_writer() -> None:
+        try:
+            flush_crops()
+        finally:
+            crop_writer.shutdown(wait=True)
+
+    def clear_checkpoint() -> None:
+        flush_crops()
+        ckpt_path.unlink(missing_ok=True)
+        shutil.rmtree(crops_dir, ignore_errors=True)
+
     tracks: list[_Track] = []
     cuts: list[int] = []
     next_uid = 1
@@ -645,6 +750,13 @@ def run_pipeline_streaming(
                     tracks.append(tr)
                     closed_tracks.append(tr)
                     if tr.tl.redact is None:
+                        saved = crops_dir / f"{tr.uid}.png"
+                        if saved.is_file():
+                            try:
+                                with Image.open(saved) as image:
+                                    tr.best_crop = np.asarray(image.convert("RGB")).copy()
+                            except (OSError, ValueError):
+                                logger.warning("track %s: unreadable saved crop", tr.uid)
                         frontier.add(tr)
                         decider.submit(tr)
                     else:
@@ -656,7 +768,7 @@ def run_pipeline_streaming(
 
     if not resume or force:
         try:
-            ckpt_path.unlink(missing_ok=True)
+            clear_checkpoint()
         except Exception:
             pass
         try:
@@ -669,13 +781,37 @@ def run_pipeline_streaming(
 
     open_tracks: dict[int, _Track] = {}
 
+    def commit(track: _Track, entry: tuple) -> None:
+        score, frame_idx, box, others, source = entry
+        if score > track.best_score:  # strict: earliest wins ties
+            track.best_score = score
+            track.tl.best_frame = frame_idx
+            track.best_box = box
+            track.best_others = others
+            track.best_crop = crop_snapshot(source, box, padding).copy()
+
+    hold = MAX_LOOKBACK if view_split else 0
+
     def close(track: _Track) -> None:
+        for entry in track.pending:
+            commit(track, entry)
+        track.pending.clear()
         track.closed = True
         closed_tracks.append(track)
+        if track.best_crop is not None and checkpoint_interval > 0:
+            try:
+                crops_dir.mkdir(parents=True, exist_ok=True)
+                crop_writes[:] = [w for w in crop_writes if not w.done()]
+                crop_writes.append(
+                    crop_writer.submit(_write_crop, track.best_crop, crops_dir / f"{track.uid}.png")
+                )
+            except Exception:
+                logger.warning("track %s: could not save its crop", track.uid, exc_info=True)
         decider.submit(track)
 
     def save_ckpt(last_frame: int) -> None:
         try:
+            flush_crops()
             data = {
                 "video": str(video.resolve()),
                 "last_frame": last_frame,
@@ -723,10 +859,17 @@ def run_pipeline_streaming(
     bars = contextlib.ExitStack()
     cbs: dict[str, Any] = {}
     for position, desc in enumerate(("track", "classify", "ship")):
+        kwargs = {"position": position}
+        if desc in ("track", "ship"):
+            kwargs["fps"] = info.fps
         try:
-            ctx = bar(desc, position=position)
+            ctx = bar(desc, **kwargs)
         except TypeError:
-            ctx = bar(desc)
+            kwargs.pop("fps", None)
+            try:
+                ctx = bar(desc, **kwargs)
+            except TypeError:
+                ctx = bar(desc)
         cbs[desc] = bars.enter_context(ctx)
 
     def report(frame_idx: int) -> None:
@@ -776,10 +919,40 @@ def run_pipeline_streaming(
                     for tid, observations in obs.items():
                         for _fi, box, kps in observations:
                             track = open_tracks.get(tid)
+                            views, parent, carried = None, None, None
+                            if view_split:
+                                moved = track.views.update(kps) - 1 if track is not None else -1
+                                if moved >= 0:
+                                    # The new view began `moved` observations ago:
+                                    # those go to the new track, not the old one.
+                                    views, parent = track.views, track
+                                    telemetry.count("view_split", "splits")
+                                    tl = track.tl
+                                    first = tl.frames[len(tl.frames) - moved] if moved else frame_idx
+                                    carried = (
+                                        tl.frames[len(tl.frames) - moved:],
+                                        tl.boxes[len(tl.boxes) - moved:],
+                                        tl.keypoints[len(tl.keypoints) - moved:],
+                                        [e for e in track.pending if e[1] >= first],
+                                    )
+                                    if moved:
+                                        del tl.frames[-moved:], tl.boxes[-moved:], tl.keypoints[-moved:]
+                                        track.pending = [e for e in track.pending if e[1] < first]
+                                    close(track)
+                                    del open_tracks[tid]
+                                    track = None
+                                elif track is None:
+                                    views = ViewTracker(track_cfg.view_min_frames, track_cfg.view_min_regions)
+                                    views.update(kps)
                             fresh = track is None
                             if fresh:
                                 tl = Tracklet(track_id=next_uid, frames=[], boxes=[], keypoints=[])
-                                track = _Track(uid=next_uid, tracker_id=tid, tl=tl)
+                                track = _Track(uid=next_uid, tracker_id=tid, tl=tl, views=views, parent=parent)
+                                if carried is not None:
+                                    tl.frames.extend(carried[0])
+                                    tl.boxes.extend(carried[1])
+                                    tl.keypoints.extend(carried[2])
+                                    track.pending.extend(carried[3])
                                 next_uid += 1
                                 open_tracks[tid] = track
                                 tracks.append(track)
@@ -797,12 +970,11 @@ def run_pipeline_streaming(
                             score = observation_score(
                                 box, kps, w, h, [ob for _, ob in others], **score_kwargs
                             )
-                            if score > track.best_score:  # strict: earliest wins ties
-                                track.best_score = score
-                                track.tl.best_frame = frame_idx
-                                track.best_box = box
-                                track.best_others = [(uid, list(ob)) for uid, ob in others]
-                                track.best_crop = crop_snapshot(frame, box, padding).copy()
+                            track.pending.append(
+                                (score, frame_idx, box, [(uid, list(ob)) for uid, ob in others], frame)
+                            )
+                            while len(track.pending) > hold:
+                                commit(track, track.pending.pop(0))
 
                 for tid, track in list(open_tracks.items()):
                     if frame_idx - track.last > close_gap:
@@ -852,11 +1024,15 @@ def run_pipeline_streaming(
                 while shipper.is_alive():
                     shipper.join(0.5)
                     report(max(last_idx, 0))
+            if player is not None:
+                player.finish()
             if frontier.fatal is not None:
                 raise frontier.fatal
             decider.drain()
             report(max(last_idx, 0))
     except BaseException as error:
+        if player is not None:
+            player.finish(timeout=0)
         abort.set()
         frontier.fail(error)
         decider.pool.shutdown(wait=False, cancel_futures=True)
@@ -865,6 +1041,7 @@ def run_pipeline_streaming(
             save_ckpt(max(last_idx, 0))
         except Exception:
             pass
+        stop_crop_writer()
         raise
     # Final metadata, numbered exactly as the staged pipeline would.
     meta = _build_meta(video, info, tracks, cuts if scene_cuts else [], thumbs, scene_cuts)
@@ -878,9 +1055,10 @@ def run_pipeline_streaming(
         except Exception:
             pass
         try:
-            ckpt_path.unlink(missing_ok=True)
+            clear_checkpoint()
         except Exception:
             pass
+        stop_crop_writer()
         save_meta(meta_file, meta)
         raise ClassifyError(
             f"{len(undecided)} tracklet(s) could not be classified: {undecided} "
@@ -889,6 +1067,9 @@ def run_pipeline_streaming(
 
     if orphans:
         meta = _finish_with_orphans(meta, video, out, meta_file, thumbs, prompt, clf, cfg)
+        if vlc:
+            progress("[vlc] orphans mode has no live output; opening the result")
+            play_file(out)
     elif keyframes:
         with telemetry.timed("ship.finalize"):
             subprocess.run(
@@ -903,10 +1084,11 @@ def run_pipeline_streaming(
                 pass
     shutil.rmtree(work_dir, ignore_errors=True)
     try:
-        ckpt_path.unlink(missing_ok=True)
+        clear_checkpoint()
     except Exception:
         pass
- 
+    stop_crop_writer()
+
     save_meta(meta_file, meta)
     stages.record("track", track_key)
     stages.record("snapshot", snapshot_key)
@@ -917,6 +1099,12 @@ def run_pipeline_streaming(
 
     redacted = sum(1 for t in meta.tracklets if t.effective_redact)
     progress(f"{len(meta.tracklets)} tracklet(s), {redacted} redacted; wrote {out}")
+    if player is not None and player.alive:
+        progress("[vlc] processing done; VLC keeps playing what is buffered (Ctrl-C to close)")
+        try:
+            player.wait()
+        except KeyboardInterrupt:
+            player.stop()
     return {"out": out, "meta_path": meta_file, "tracklets": len(meta.tracklets), "redacted": redacted}
 
 

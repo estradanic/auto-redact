@@ -326,3 +326,105 @@ def test_concurrent_classification_matches_sequential(meta) -> None:
 def test_invalid_workers_rejected(meta) -> None:
     with pytest.raises(ValueError, match="workers"):
         classify_snapshots(meta, "x", workers=0)
+
+
+def test_vram_reserve_explicit_value_skips_detection(monkeypatch) -> None:
+    from auto_redact import classify
+    from auto_redact.config import ClassifyConfig
+
+    monkeypatch.setattr(
+        classify, "vlm_shares_gpu", lambda cfg: pytest.fail("should not probe")
+    )
+    assert classify.resolve_vlm_vram_reserve(ClassifyConfig(vlm_vram_reserve_mb=123)) == 123
+    assert classify.resolve_vlm_vram_reserve(ClassifyConfig(vlm_vram_reserve_mb=0)) == 0
+
+
+@pytest.mark.parametrize(
+    "shares, expected",
+    [(True, 2500), (None, 2500), (False, 0)],
+)
+def test_vram_reserve_auto(monkeypatch, shares, expected) -> None:
+    from auto_redact import classify
+    from auto_redact.config import ClassifyConfig
+
+    monkeypatch.setattr(classify, "vlm_shares_gpu", lambda cfg: shares)
+    assert classify.resolve_vlm_vram_reserve(ClassifyConfig()) == expected
+
+
+def test_remote_ollama_never_shares_this_gpu() -> None:
+    from auto_redact.classify import vlm_shares_gpu
+    from auto_redact.config import ClassifyConfig
+
+    assert vlm_shares_gpu(ClassifyConfig(ollama_url="http://192.0.2.1:11434")) is False
+
+
+@pytest.mark.parametrize("pids, expected", [({4242}, True), (set(), False), (None, None)])
+def test_local_ollama_sharing_depends_on_gpu_processes(ollama, monkeypatch, pids, expected) -> None:
+    from auto_redact import classify
+    from auto_redact.config import ClassifyConfig
+
+    stub = ollama([""])
+    monkeypatch.setattr(classify, "_ollama_gpu_pids", lambda: pids)
+    config = ClassifyConfig(ollama_url=stub.url, model="m")
+
+    assert classify.vlm_shares_gpu(config) is expected
+    assert stub.requests[0]["body"]["model"] == "m"  # model preloaded first
+
+
+def test_unreachable_local_ollama_is_undetermined(monkeypatch) -> None:
+    from auto_redact import classify
+    from auto_redact.config import ClassifyConfig
+
+    monkeypatch.setattr(classify, "_ollama_gpu_pids", lambda: set())
+    assert classify.vlm_shares_gpu(ClassifyConfig(ollama_url="http://127.0.0.1:9")) is None
+
+
+def test_decision_metrics_record_scores_routing_and_verdicts(tmp_path, monkeypatch) -> None:
+    from auto_redact import telemetry
+    from auto_redact.classify import record_decision_metrics
+
+    monkeypatch.setenv("AUTO_REDACT_STATS", "1")
+    monkeypatch.setenv("AUTO_REDACT_STATS_DIR", str(tmp_path))
+    run = telemetry.begin("test", {})
+    assert run is not None
+    try:
+        settled = Decision(False, 0.12, "score 0.120 vs threshold 0.3")
+        record_decision_metrics(1, settled, settled, "positives")
+        asked = Decision(True, 0.42, "score 0.420 vs threshold 0.3")
+        record_decision_metrics(2, asked, Decision(False, None, "No."), "positives")
+        record_decision_metrics(3, None, Decision(True, None, "Yes."), "none")
+
+        stats = run.stats
+        assert stats["dists"]["prefilter.score"]["count"] == 2
+        assert stats["dists"]["prefilter.score"]["bins"][1] == 1  # 0.12 -> 0.1-0.2
+        assert stats["dists"]["prefilter.score"]["bins"][4] == 1  # 0.42 -> 0.4-0.5
+        assert stats["dists"]["prefilter.score[sent_to_vlm]"]["count"] == 1
+        assert stats["counts"]["prefilter.routed"] == {"prefilter": 1, "vlm": 1}
+        assert stats["counts"]["decisions[prefilter]"] == {"keep": 1}
+        assert stats["counts"]["decisions[vlm]"] == {"keep": 1}
+        assert stats["counts"]["decisions[classifier]"] == {"redact": 1}
+        assert stats["counts"]["vlm.verdict_by_prefilter_band"] == {"0.4-0.5:keep": 1}
+        lines = [json.loads(x) for x in (run.dir / "decisions.jsonl").read_text().splitlines()]
+        assert [(x["track"], x["route"], x["verdict"]) for x in lines] == [
+            (1, "prefilter", "keep"), (2, "vlm", "keep"), (3, "classifier", "redact"),
+        ]
+        assert lines[1]["prefilter_score"] == 0.42
+    finally:
+        telemetry.end(0)
+
+
+def test_prompt_expression_asks_one_question_per_leaf_through_the_stage(meta, ollama) -> None:
+    # Replies cycle: track 1 gets yes then no then yes, track 2 gets no.
+    stub = ollama(["Yes", "No", "Yes", "No"])
+    prompt = '"a woman" and ("bare thighs" or "lingerie")'
+
+    classify_snapshots(meta, prompt, ollama_url=stub.url, workers=1)
+
+    asked = [r["body"]["prompt"] for r in stub.requests]
+    assert ["a woman" in q for q in asked[:3]] == [True, False, False]
+    assert "bare thighs" in asked[1] and "lingerie" in asked[2]
+    assert "a woman" in asked[3]  # track 2 stops at the first leaf ("No")
+    assert len(asked) == 4
+    assert [t.redact for t in meta.tracklets] == [True, False]
+    assert "'bare thighs': no" in meta.tracklets[0].detail
+    assert meta.tracklets[0].detail.endswith("-> yes")

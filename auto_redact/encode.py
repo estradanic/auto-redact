@@ -196,10 +196,13 @@ def encode_full(
     preset: str,
     encoder: Encoder,
     on_progress: Callable[[int, int], None] | None = None,
+    live: Path | None = None,
 ) -> None:
     """Decode every frame, paint redactions and re-encode the whole video.
 
-    Audio is copied unchanged when the source has any.
+    Audio is copied unchanged when the source has any. With ``live``, the same
+    encode is also written to that path as MPEG-TS, growing as it goes, so a
+    player can follow it (the main output is a fragmented MP4 either way).
     """
     command = ["ffmpeg", "-v", "error", "-y", *raw_input_args(probe)]
     audio = getattr(probe, "has_audio", None)
@@ -210,8 +213,18 @@ def encode_full(
     command += ["-map", "0:v:0"]
     if audio:
         command += ["-map", "1:a:0", "-c:a", "copy"]
-    command += [*encoder.codec_args(crf, preset), "-pix_fmt", "yuv420p",
-               "-movflags", "frag_keyframe+empty_moov", str(out)]
+    command += [*encoder.codec_args(crf, preset), "-pix_fmt", "yuv420p"]
+    if live is None:
+        command += ["-movflags", "frag_keyframe+empty_moov", str(out)]
+    else:
+        # MPEG-TS carries only some audio codecs; the live copy goes without otherwise.
+        ts_audio = audio and _audio_codec(source) in TS_AUDIO_CODECS
+        live_select = "" if ts_audio or not audio else ":select=v"
+        command += [
+            "-f", "tee",
+            f"[f=mp4:movflags=frag_keyframe+empty_moov]{_tee_escape(out)}"
+            f"|[f=mpegts:flush_packets=1{live_select}]{_tee_escape(live)}",
+        ]
 
     with ffmpeg_stdin(command, source) as stdin:
         for frame_idx, frame in iter_frames(source):
@@ -221,6 +234,23 @@ def encode_full(
                 on_progress(frame_idx + 1, probe.frame_count)
     if on_progress is not None and probe.frame_count > 0:
         on_progress(probe.frame_count, probe.frame_count)
+
+TS_AUDIO_CODECS = {"aac", "ac3", "eac3", "mp3", "mp2"}
+
+
+def _audio_codec(path: Path) -> str | None:
+    with av.open(str(path)) as container:
+        if not container.streams.audio:
+            return None
+        return container.streams.audio[0].codec_context.name
+
+
+def _tee_escape(path: Path) -> str:
+    text = str(path)
+    for char in "\\:|[]'":
+        text = text.replace(char, "\\" + char)
+    return text
+
 
 def run_ffmpeg(arguments: list[str]) -> None:
     proc = subprocess.run(

@@ -20,6 +20,7 @@ from pathlib import Path
 from . import telemetry
 from .classify import ClassifyError, Decision
 from .config import DEFAULT_SIGLIP_MODEL, ClassifyConfig
+from .prompts import Leaf, evaluate, parse_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,9 @@ _GENERIC_NEGATIVES = (
     "a photo of a person in plain clothes",
     "a photo of an empty scene",
 )
+
+
+IMAGE_CACHE_SIZE = 8  # recent image embeddings kept (one prompt expression scores one image at a time)
 
 
 def positive_label(prompt: str) -> str:
@@ -74,6 +78,12 @@ class SiglipClassifier:
         self._processor = None
         self._device = None
         self._lock = threading.Lock()
+        # Normalised image embeddings (a few recent images: every leaf of a
+        # prompt expression scores the same one) and text embeddings (one per
+        # leaf, constant across images). Both live on ``_device``.
+        self._image_embeds: dict = {}
+        self._text_embeds: dict = {}
+        self._embeddings_unsupported = False
         # Set when "auto" placed us on the CPU because the GPU was too full
         # (or OOM'd on the way to it). Only such instances are eligible for
         # later promotion to the GPU.
@@ -137,6 +147,7 @@ class SiglipClassifier:
                 f"could not load SigLIP model {self.model_name!r}: {error}"
             ) from error
         self._device = device
+        self._clear_embeddings()
         logger.info("siglip: %s loaded on %s (%.1fs to move)", self.model_name, device, time.perf_counter() - start)
         telemetry.note(f"siglip_device[{self.model_name}]", device)
 
@@ -197,6 +208,7 @@ class SiglipClassifier:
             self._model = new_model
             self._device = "cuda"
             self.device = "cuda"
+            self._clear_embeddings()
             self._auto_cpu_pressure = False
             try:
                 torch.cuda.empty_cache()
@@ -207,7 +219,18 @@ class SiglipClassifier:
             return True
 
     def score(self, image_path: str | Path, prompt: str) -> float:
-        """Probability (0-1) that the image matches ``prompt`` over the negatives."""
+        """Probability (0-1) that the image matches the single description ``prompt``."""
+        return self._score_leaf(image_path, prompt)
+
+    def score_prompt(self, image_path: str | Path, prompt: str) -> float | None:
+        """Like :meth:`score`, but ``prompt`` may be an expression: the fuzzy
+        combination (min / max / 1 - s) of its leaves' scores."""
+        node = parse_prompt(prompt)
+        if isinstance(node, Leaf):
+            return self.score(image_path, node.text)
+        return evaluate(node, lambda leaf: self._classify_leaf(image_path, leaf)).score
+
+    def _score_leaf(self, image_path: str | Path, prompt: str) -> float:
         import torch
         from PIL import Image
 
@@ -217,7 +240,63 @@ class SiglipClassifier:
             with telemetry.timed(f"siglip.score[{self._device}]"):
                 return self._score(image_path, prompt, torch, Image)
 
+    def _clear_embeddings(self) -> None:
+        self._image_embeds.clear()
+        self._text_embeds.clear()
+
     def _score(self, image_path, prompt, torch, Image) -> float:
+        """Match probability for one description.
+
+        The image is encoded once and its embedding reused by every leaf of a
+        prompt expression, and each leaf's text embeddings are computed once
+        for the whole run, so a leaf costs a dot product instead of a model
+        forward pass. The numbers are identical to running the full model on
+        (image, labels) each time; models without the embedding methods fall
+        back to that.
+        """
+        if not self._embeddings_unsupported:
+            try:
+                return self._score_cached(image_path, prompt, torch, Image)
+            except (AttributeError, TypeError) as error:
+                logger.info("siglip: embedding cache unavailable (%s); scoring without it", error)
+                self._embeddings_unsupported = True
+                self._clear_embeddings()
+        return self._score_direct(image_path, prompt, torch, Image)
+
+    def _score_cached(self, image_path, prompt, torch, Image) -> float:
+        def normalised(features):
+            features = getattr(features, "pooler_output", features)  # newer transformers wrap the tensor
+            return features / features.norm(p=2, dim=-1, keepdim=True)
+
+        path = Path(image_path)
+        stat = path.stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        image_embed = self._image_embeds.get(key)
+        if image_embed is None:
+            with Image.open(path) as image:
+                image = image.convert("RGB")
+            pixels = self._processor.image_processor(images=image, return_tensors="pt")
+            pixels = {name: value.to(self._device) for name, value in pixels.items()}
+            with torch.no_grad():
+                image_embed = normalised(self._model.get_image_features(**pixels))
+            if len(self._image_embeds) >= IMAGE_CACHE_SIZE:
+                self._image_embeds.pop(next(iter(self._image_embeds)))
+            self._image_embeds[key] = image_embed
+        text_embed = self._text_embeds.get(prompt)
+        if text_embed is None:
+            labels = [positive_label(prompt)] + derive_negatives(prompt)
+            tokens = self._processor(
+                text=labels, padding="max_length", max_length=64, return_tensors="pt"
+            ).to(self._device)
+            text_inputs = {name: tokens[name] for name in ("input_ids", "attention_mask") if name in tokens}
+            with torch.no_grad():
+                text_embed = normalised(self._model.get_text_features(**text_inputs))
+            self._text_embeds[prompt] = text_embed
+        with torch.no_grad():
+            logits = (image_embed @ text_embed.T) * self._model.logit_scale.exp() + self._model.logit_bias
+            return float(torch.softmax(logits[0].float(), dim=-1)[0])
+
+    def _score_direct(self, image_path, prompt, torch, Image) -> float:
         labels = [positive_label(prompt)] + derive_negatives(prompt)
         with Image.open(image_path) as image:
             image = image.convert("RGB")
@@ -233,7 +312,14 @@ class SiglipClassifier:
         return float(torch.softmax(logits.float(), dim=-1)[0])
 
     def classify(self, image_path: str | Path, prompt: str) -> Decision:
-        score = self.score(image_path, prompt)
+        """Score ``prompt``; for a prompt expression each leaf is scored and
+        thresholded on its own, then combined (see :mod:`auto_redact.prompts`)."""
+        return evaluate(
+            parse_prompt(prompt), lambda leaf: self._classify_leaf(image_path, leaf), "siglip"
+        )
+
+    def _classify_leaf(self, image_path: str | Path, prompt: str) -> Decision:
+        score = self.score(image_path, prompt)  # a leaf: overridable, as before
         return Decision(
             score >= self.threshold,
             score,

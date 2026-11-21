@@ -27,6 +27,7 @@ import av
 from av.bitstream import BitStreamFilterContext
 
 from .encode import (
+    TS_AUDIO_CODECS,
     concat_video,
     encode_full,
     ffmpeg_stdin,
@@ -253,6 +254,76 @@ def copy_segment(
                 for out_packet in (sei_filter.filter(packet) if sei_filter else [packet]):
                     out_packet.stream = output_stream
                     output_container.mux(out_packet)
+
+
+def add_audio_to_part(
+    video_part: Path,
+    part: Path,
+    source: Path,
+    keyframes: dict[int, int],
+    segment: Segment,
+    retime: bool,
+) -> bool:
+    """Write ``part`` as ``video_part`` plus the source audio covering ``segment``.
+
+    The audio window is the segment's keyframe times, the same boundaries the
+    video uses, so consecutive parts tile with no gap or overlap (the first
+    part also keeps any audio before the first keyframe). ``retime`` shifts
+    the video so its first frame lands on the keyframe's source time; encoded
+    parts need it because their timestamps start from a frame-rate guess.
+
+    Returns False, leaving ``part`` unwritten, when the source has no audio
+    that MPEG-TS can carry; the caller then uses ``video_part`` as is.
+    """
+    with av.open(str(source)) as src:
+        if not src.streams.video or not src.streams.audio:
+            return False
+        v_src, a_src = src.streams.video[0], src.streams.audio[0]
+        if a_src.codec_context.name not in TS_AUDIO_CODECS:
+            return False
+        a_tb = float(a_src.time_base)
+        t_lo = keyframes[segment.start] * float(v_src.time_base)
+        high = keyframes.get(segment.end)
+        t_hi = None if high is None else high * float(v_src.time_base)
+        lower = float("-inf") if segment.start == min(keyframes) else t_lo
+        try:
+            src.seek(int(max(lower, 0.0) / a_tb), stream=a_src, backward=True)
+        except Exception:
+            pass
+        audio_packets = []
+        for packet in src.demux(a_src):
+            if packet.pts is None:
+                continue
+            t = packet.pts * a_tb
+            if t < lower:
+                continue
+            if t_hi is not None and t >= t_hi:
+                break
+            audio_packets.append(packet)
+
+        with av.open(str(video_part)) as vin:
+            v_in = vin.streams.video[0]
+            video_packets = [p for p in vin.demux(v_in) if p.pts is not None]
+            shift = 0.0
+            if retime and video_packets:
+                shift = t_lo - min(p.pts for p in video_packets) * float(v_in.time_base)
+            for packet in video_packets:
+                delta = round(shift / float(packet.time_base))
+                packet.pts += delta
+                if packet.dts is not None:
+                    packet.dts += delta
+            with av.open(str(part), "w") as out:
+                v_out = out.add_stream_from_template(v_in)
+                a_out = out.add_stream_from_template(a_src)
+                tagged = [(p, v_out) for p in video_packets] + [(p, a_out) for p in audio_packets]
+                tagged.sort(
+                    key=lambda item: (item[0].dts if item[0].dts is not None else item[0].pts)
+                    * float(item[0].time_base)
+                )
+                for packet, stream in tagged:
+                    packet.stream = stream
+                    out.mux(packet)
+    return True
 
 
 def encode_segment(

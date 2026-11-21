@@ -23,10 +23,12 @@ from .classify import ClassifyError, classify_snapshots
 from .config import SECTIONS, dest_name, from_namespace, parse_overrides, primary_flag
 from .meta import MetaError, load_meta, save_meta
 from .pipeline import run_pipeline
+from .prompts import normalize_prompt, parse_prompt
 from .render import RenderError, render_redacted
 from .scene import SceneError
 from .snapshot import SnapshotError, select_snapshots
 from .streaming import run_pipeline_streaming
+from .frames import probe_video
 from .track import add_orphan_tracklets, build_tracklets
 from .ui import progress_bar, setup_logging
 
@@ -250,6 +252,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--streaming", action="store_true", default=False,
         help="Use the single-pass streaming pipeline (experimental)",
     )
+    run.add_argument(
+        "--vlc", action="store_true", default=False,
+        help="Play the output in VLC while it is being produced (requires --streaming)",
+    )
     add_config_options(run, ("track", "snapshot", "classify", "render"))
     _add_common(run)
 
@@ -343,7 +349,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         bar=progress_bar,
     )
     if args.streaming:
-        result = run_pipeline_streaming(args.video, args.prompt, out, cfg, **common)
+        result = run_pipeline_streaming(
+            args.video, args.prompt, out, cfg, vlc=args.vlc, **common
+        )
         print(
             f"{result['tracklets']} tracklet(s), {result['redacted']} redacted; "
             f"wrote {result['out']}"
@@ -363,13 +371,14 @@ def _cmd_track(args: argparse.Namespace) -> int:
     stages = cache.StageCache(args.meta)
     key = cache.track_key(args.video, cfg.track)
     stages.begin("track", key)
-    with progress_bar("track") as on_progress:
+    video_info = probe_video(args.video)
+    with progress_bar("track", fps=video_info.fps) as on_progress:
         meta = build_tracklets(
             args.video, cfg.track, on_progress=on_progress, meta_path=args.meta,
             resume=cfg.resume,
         )
     if cfg.track.orphans:
-        with progress_bar("orphan") as orphan_progress:
+        with progress_bar("orphan", fps=video_info.fps) as orphan_progress:
             meta = add_orphan_tracklets(meta, args.video, on_progress=orphan_progress)
     if cfg.track.scene_cuts:
         print(
@@ -397,7 +406,7 @@ def _cmd_snapshot(args: argparse.Namespace) -> int:
         stages.matches("snapshot", key) or stages.begin("snapshot", key)
     )
     meta = load_meta(args.meta)
-    with progress_bar("snapshot") as on_progress:
+    with progress_bar("snapshot", fps=meta.video.fps) as on_progress:
         select_snapshots(
             meta, args.thumbs, snapshot_cfg,
             on_progress=on_progress, resume=resume, meta_path=args.meta,
@@ -449,7 +458,7 @@ def _cmd_render(args: argparse.Namespace) -> int:
     cfg = from_namespace(args)
     meta = load_meta(args.meta)
     out = _resolve_out(args.out, meta.video.path)
-    with progress_bar("render") as on_progress:
+    with progress_bar("render", fps=meta.video.fps) as on_progress:
         out = render_redacted(meta, out, cfg.render, on_progress=on_progress)
     print(f"wrote {out}")
     return 0
@@ -621,7 +630,10 @@ def _apply_config_file(
             continue
         if subcommand == "review" and key == "video" and "--meta" in argv:
             continue  # --video and --meta are alternatives there
-        injection = [flag, str(cfg[key])]
+        value = cfg[key]
+        if key == "prompt":
+            value = normalize_prompt(value)  # a YAML all/any/not mapping becomes JSON
+        injection = [flag, str(value)]
         index = argv.index(subcommand) + 1 if subcommand in argv else 0
         argv = argv[:index] + injection + argv[index:]
 
@@ -652,6 +664,16 @@ def main(argv=None) -> int:
             return 1
         argv = _apply_config_file(parser, argv, cfg)
     args = parser.parse_args(argv)
+    if getattr(args, "vlc", False):
+        if not args.streaming:
+            parser.error("--vlc requires --streaming")
+        if shutil.which("vlc") is None:
+            parser.error("--vlc: vlc was not found on PATH")
+    if getattr(args, "prompt", None) is not None:
+        try:
+            parse_prompt(args.prompt)
+        except ValueError as error:
+            parser.error(f"--prompt: {error}")
     if getattr(args, "set_options", None):
         try:
             args.config_overrides = parse_overrides(args.set_options, args.config_sections)

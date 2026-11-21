@@ -22,6 +22,7 @@ from .meta import Metadata, MetaError, load_meta, save_meta, save_meta_summary
 from .render import render_redacted
 from .snapshot import select_snapshots
 from .workspace import labels_path_for, resolve_run_paths
+from .frames import probe_video
 from .track import add_orphan_tracklets, build_tracklets
 
 
@@ -57,6 +58,7 @@ def run_pipeline(
 ) -> RunSummary:
     cfg = config if config is not None else Config()
     resume = cfg.resume
+    fps = probe_video(video).fps
     meta_file, thumbs = resolve_run_paths(video, out, meta_path, thumbs_dir, progress)
     stages = cache.StageCache(meta_file)
     reused: list[str] = []
@@ -90,13 +92,21 @@ def run_pipeline(
     if meta is None:
         progress(f"[1/4 track] tracking people in {video}")
         stages.begin("track", track_key)
-        with telemetry.stage("track"), bar("track") as on_progress:
+        try:
+            _track_bar = bar("track", fps=fps)
+        except TypeError:
+            _track_bar = bar("track")
+        with telemetry.stage("track"), _track_bar as on_progress:
             meta = build_tracklets(
                 video, cfg.track, on_progress=on_progress, meta_path=meta_file,
                 resume=resume and not force,
             )
         if cfg.track.orphans:
-            with telemetry.stage("orphan"), bar("orphan") as orphan_progress:
+            try:
+                _orphan_bar = bar("orphan", fps=fps)
+            except TypeError:
+                _orphan_bar = bar("orphan")
+            with telemetry.stage("orphan"), _orphan_bar as orphan_progress:
                 meta = add_orphan_tracklets(meta, video, on_progress=orphan_progress)
         if cfg.track.scene_cuts:
             progress(
@@ -121,7 +131,11 @@ def run_pipeline(
     else:
         progress("[2/4 snapshot] selecting best frames")
         resume_snapshots = resume and stages.begin("snapshot", snapshot_key)
-        with telemetry.stage("snapshot"), bar("snapshot") as on_progress:
+        try:
+            _snapshot_bar = bar("snapshot", fps=fps)
+        except TypeError:
+            _snapshot_bar = bar("snapshot")
+        with telemetry.stage("snapshot"), _snapshot_bar as on_progress:
             for tracklet in meta.tracklets:
                 tracklet.best_frame = None
                 tracklet.best_snapshot_path = None
@@ -188,7 +202,11 @@ def run_pipeline(
 
     redacted = sum(1 for t in meta.tracklets if t.effective_redact)
     progress(f"[4/4 render] redacting {redacted} of {len(meta.tracklets)}")
-    with telemetry.stage("render"), bar("render") as on_progress:
+    try:
+        _render_bar = bar("render", fps=fps)
+    except TypeError:
+        _render_bar = bar("render")
+    with telemetry.stage("render"), _render_bar as on_progress:
         result = render_redacted(meta, out, cfg.render, on_progress=on_progress)
     return RunSummary(
         out=Path(result),

@@ -156,6 +156,10 @@ def _decode_frames(
             stream.thread_count = threads
         fps = float(stream.average_rate) if stream.average_rate else 0.0
         time_base = float(stream.time_base) if stream.time_base else 0.0
+        # Frame 0 is the stream's first timestamp, which is not 0 for many
+        # files (e.g. Matroska starting at 105 ms): without this, indexes
+        # derived from pts run ahead of a sequential decode by a few frames.
+        origin = stream.start_time if stream.start_time is not None else 0
 
         # When a start offset is requested, seek to the keyframe just before
         # it instead of decoding the whole prefix from frame 0. Inter-frame
@@ -181,7 +185,7 @@ def _decode_frames(
         for frame in container.decode(video=0):
             if frame.pts is None:
                 continue
-            frame_idx = int(round(frame.pts * time_base * fps))
+            frame_idx = int(round((frame.pts - origin) * time_base * fps))
             if stop is not None and frame_idx >= stop:
                 break
             if frame_idx < start:

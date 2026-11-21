@@ -119,6 +119,8 @@ class Run:
             "started": _dt.datetime.fromtimestamp(self.started).isoformat(timespec="seconds"),
             "stages": [],
             "ops": {},
+            "dists": {},
+            "counts": {},
             "notes": {},
             "peaks": {"rss_mb": 0.0, "gpu_used_mb": 0.0},
             "error": None,
@@ -190,6 +192,34 @@ class Run:
         self.stats["notes"][key] = value
         logging.getLogger("auto_redact.telemetry").debug("note %s=%s", key, value)
 
+    def observe(self, name: str, value: float, lo: float = 0.0, hi: float = 1.0, bins: int = 10) -> None:
+        """Add a sample to a distribution: count, min/max/mean and a fixed-width histogram."""
+        with self._lock:
+            dist = self.stats["dists"].setdefault(
+                name,
+                {"count": 0, "sum": 0.0, "min": value, "max": value, "bins": [0] * bins, "range": [lo, hi]},
+            )
+            dist["count"] += 1
+            dist["sum"] += value
+            dist["min"] = min(dist["min"], value)
+            dist["max"] = max(dist["max"], value)
+            n = len(dist["bins"])
+            idx = int((value - dist["range"][0]) / (dist["range"][1] - dist["range"][0]) * n)
+            dist["bins"][max(0, min(n - 1, idx))] += 1
+
+    def count(self, name: str, key: str) -> None:
+        """Increment a labelled counter, e.g. ``count("decisions.routed", "vlm")``."""
+        with self._lock:
+            group = self.stats["counts"].setdefault(name, {})
+            group[key] = group.get(key, 0) + 1
+
+    def event(self, name: str, payload: dict) -> None:
+        """Append one JSON line to ``<run dir>/<name>.jsonl``."""
+        line = json.dumps(payload, default=str) + "\n"
+        with self._lock:
+            with open(self.dir / f"{name}.jsonl", "a", encoding="utf-8") as handle:
+                handle.write(line)
+
     def finish(self, exit_code: int | None, exc: BaseException | None = None) -> None:
         self._stop.set()
         try:
@@ -209,6 +239,9 @@ class Run:
             op["mean_s"] = round(op["total_s"] / op["count"], 4)
             op["total_s"] = round(op["total_s"], 3)
             op["max_s"] = round(op["max_s"], 3)
+        for dist in self.stats["dists"].values():
+            dist["mean"] = round(dist["sum"] / dist["count"], 4)
+            dist["sum"] = round(dist["sum"], 4)
         (self.dir / "stats.json").write_text(
             json.dumps(self.stats, indent=2, default=str) + "\n", encoding="utf-8"
         )
@@ -277,3 +310,18 @@ def timed(name: str):
 def note(key: str, value) -> None:
     if _active is not None:
         _active.note(key, value)
+
+
+def observe(name: str, value: float, lo: float = 0.0, hi: float = 1.0, bins: int = 10) -> None:
+    if _active is not None:
+        _active.observe(name, value, lo, hi, bins)
+
+
+def count(name: str, key: str) -> None:
+    if _active is not None:
+        _active.count(name, key)
+
+
+def event(name: str, payload: dict) -> None:
+    if _active is not None:
+        _active.event(name, payload)

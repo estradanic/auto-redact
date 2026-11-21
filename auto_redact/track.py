@@ -20,6 +20,7 @@ records (frames + boxes + keypoints, aligned by index), wrapped in a
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Callable
@@ -27,7 +28,7 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from .scene import _frame_hist, split_tracklets_at_cuts
+from .scene import rgb_frame_hist, split_tracklets_at_cuts
 
 from .config import TrackConfig, resolve
 from .detectors import make_detector, make_tracker
@@ -35,6 +36,8 @@ from .frames import iter_frames, probe_video
 from .geometry import box_iou
 from .meta import Metadata, Tracklet, VideoInfo, save_meta
 from .protocols import PersonDetector, PersonTracker
+
+logger = logging.getLogger(__name__)
 
 
 # (frame index, bbox, keypoints) per observation, keyed by tracker id.
@@ -55,8 +58,7 @@ def _track_range(
     for frame_idx, frame in iter_frames(video_path, sample_rate=1, threads=os.cpu_count()):
         on_frame()
         if scene_cuts:
-            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            hist = _frame_hist(bgr)
+            hist = rgb_frame_hist(frame)
             if prev_hist is not None:
                 dist = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA))
                 if dist >= scene_cut_threshold:
@@ -177,7 +179,7 @@ def build_tracklets(
     # Scene-cut histogram continuity for resumed runs.
     if scene_cuts and start_frame > 0 and prev_hist is None:
         for fi, frame in iter_frames(video_path, sample_rate=1, stop=start_frame):
-            prev_hist = _frame_hist(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            prev_hist = rgb_frame_hist(frame)
 
     done = start_frame
 
@@ -189,8 +191,7 @@ def build_tracklets(
             on_progress(done, max(info.frame_count, done))
 
         if scene_cuts:
-            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            hist = _frame_hist(bgr)
+            hist = rgb_frame_hist(frame)
             if prev_hist is not None:
                 dist = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA))
                 if dist >= cfg.scene_cut_threshold:
@@ -241,6 +242,14 @@ def build_tracklets(
         n_splits = 0
     metadata.scene_cuts = list(cuts) if scene_cuts else []
     metadata.scene_cut_splits = n_splits
+
+    if cfg.view_split:
+        from .views import split_tracklets_at_view_changes
+
+        metadata, n_view_splits = split_tracklets_at_view_changes(
+            metadata, cfg.view_min_frames, cfg.view_min_regions
+        )
+        logger.info("view_split: %d extra tracklets from framing changes", n_view_splits)
 
     if target is not None:
         try:

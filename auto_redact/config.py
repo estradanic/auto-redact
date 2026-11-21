@@ -95,6 +95,28 @@ class TrackConfig:
         "Bhattacharyya distance threshold for a hard cut (default: %(default)s)",
         metavar="F",
     )
+    view_split: bool = _opt(
+        False,
+        "Split a tracklet when the visible body regions (head, shoulders, "
+        "hips, legs) change, e.g. a pan from hips up to the face, so each "
+        "view gets its own snapshot and verdict (default: off)",
+        cache_unless_default=True,
+    )
+    view_min_frames: int = _opt(
+        12,
+        "view_split: a view must last at least N observations before it can "
+        "split, and a shorter tail inherits the previous verdict "
+        "(default: %(default)s)",
+        metavar="N",
+        cache_unless_default=True,
+    )
+    view_min_regions: int = _opt(
+        2,
+        "view_split: how many of the 4 body regions must appear or vanish to "
+        "count as a new view (default: %(default)s)",
+        metavar="N",
+        cache_unless_default=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -245,6 +267,14 @@ class ClassifyConfig:
         metavar="DEV",
         cache=False,
     )
+    vlm_vram_reserve_mb: int | None = _opt(
+        None,
+        "prefilter: VRAM (MB) 'auto' keeps free on this GPU for the VLM "
+        "(default: auto, i.e. 2500 if ollama is found using this GPU or it "
+        "can't be determined, else 0)",
+        metavar="MB",
+        cache=False,
+    )
     on_undecided: str = _opt(
         "redact",
         "What to do with a person the classifier could not decide on (a VLM "
@@ -362,11 +392,17 @@ def resolve(cls: type[T], config: T | None, overrides: Mapping[str, Any]) -> T:
 
 
 def cache_fields(config: Any) -> dict[str, Any]:
-    """The result-affecting fields of a config, for stage cache keys."""
+    """The result-affecting fields of a config, for stage cache keys.
+
+    A field marked ``cache_unless_default`` stays out of the key while it has
+    its default value, so adding an off-by-default option does not invalidate
+    results computed before it existed.
+    """
     return {
         f.name: getattr(config, f.name)
         for f in fields(config)
         if f.metadata.get("cache", True)
+        and not (f.metadata.get("cache_unless_default") and getattr(config, f.name) == f.default)
     }
 
 

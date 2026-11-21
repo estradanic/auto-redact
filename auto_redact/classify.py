@@ -27,6 +27,7 @@ from typing import Callable
 from . import telemetry
 from .config import DEFAULT_SIGLIP_MODEL, ClassifyConfig, resolve
 from .meta import Metadata, save_meta
+from .prompts import evaluate, parse_prompt
 from .protocols import Classifier
 
 logger = logging.getLogger(__name__)
@@ -179,6 +180,10 @@ class VlmClassifier:
         self.max_image_size = max_image_size
 
     def classify(self, image_path: str | Path, prompt: str) -> Decision:
+        """Ask about ``prompt``: one question, or one per leaf of a prompt expression."""
+        return evaluate(parse_prompt(prompt), lambda leaf: self._ask(image_path, leaf), "vlm")
+
+    def _ask(self, image_path: str | Path, prompt: str) -> Decision:
         with telemetry.timed("vlm.classify"):
             reply = ask_ollama(
                 image_path,
@@ -234,6 +239,130 @@ def make_classifier(config: ClassifyConfig) -> Classifier:
     raise ValueError(f"unknown classifier {config.classifier!r}; use 'vlm' or 'siglip'")
 
 
+VLM_VRAM_RESERVE_MB = 2500
+
+
+def _is_local_url(url: str) -> bool:
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    host = urlparse(url).hostname or ""
+    if host in ("", "localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(socket.gethostbyname(host)).is_loopback
+    except (OSError, ValueError):
+        return False
+
+
+def _ollama_gpu_pids() -> set[int] | None:
+    """PIDs of ollama processes holding memory on an NVIDIA GPU, or None if unknown."""
+    import shutil
+    import subprocess
+
+    smi = shutil.which("nvidia-smi")
+    if smi is None:
+        return None
+    try:
+        out = subprocess.run(
+            [smi, "--query-compute-apps=pid", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pids: set[int] = set()
+    for line in out.split():
+        if not line.isdigit():
+            continue
+        try:
+            cmdline = Path(f"/proc/{line}/cmdline").read_bytes().replace(b"\0", b" ")
+        except OSError:
+            continue
+        if b"ollama" in cmdline or b"llama-server" in cmdline:
+            pids.add(int(line))
+    return pids
+
+
+def vlm_shares_gpu(config: ClassifyConfig) -> bool | None:
+    """Whether the VLM will hold VRAM on this machine's NVIDIA GPU.
+
+    True/False when it can be determined, None when it can't. Remote ollama
+    servers never share this GPU. For a local one the model is loaded first
+    (the first classification would do it anyway) so that its placement can
+    be observed.
+    """
+    if not _is_local_url(config.ollama_url):
+        return False
+    base = config.ollama_url.rstrip("/")
+    try:
+        load = urllib.request.Request(
+            base + "/api/generate",
+            data=json.dumps(
+                {"model": config.resolved_model, "keep_alive": config.keep_alive}
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(load, timeout=config.timeout):
+            pass
+    except Exception:
+        return None
+    pids = _ollama_gpu_pids()
+    return None if pids is None else bool(pids)
+
+
+def resolve_vlm_vram_reserve(config: ClassifyConfig) -> int:
+    """MB of VRAM the SigLIP pre-filter should leave free for the VLM."""
+    if config.vlm_vram_reserve_mb is not None:
+        return max(0, int(config.vlm_vram_reserve_mb))
+    shares = vlm_shares_gpu(config)
+    if shares is False:
+        logger.info("prefilter: ollama is not using this GPU; not reserving VRAM for the VLM")
+        return 0
+    return VLM_VRAM_RESERVE_MB
+
+
+def record_decision_metrics(
+    track_id: int | str,
+    early: Decision | None,
+    final: Decision,
+    prefilter: str = "none",
+) -> None:
+    """Record how one track was decided: pre-filter score, who decided, the verdict.
+
+    ``early`` is the SigLIP pre-filter's decision (None when there is no
+    pre-filter); ``final`` is whoever made the call (the same object when the
+    pre-filter settled it, else the VLM's). Feeds ``stats.json`` (score
+    histogram, routing and verdict counts, VLM verdict per score band) and a
+    per-track ``decisions.jsonl`` for tuning the threshold.
+    """
+    score = early.score if early is not None else None
+    if early is None:
+        route = "classifier"
+    else:
+        route = "prefilter" if final is early else "vlm"
+    verdict = "undecided" if final.redact is None else ("redact" if final.redact else "keep")
+    if score is not None:
+        telemetry.observe("prefilter.score", score)
+        telemetry.count("prefilter.routed", route)
+        if route == "vlm":
+            telemetry.observe("prefilter.score[sent_to_vlm]", score)
+            band = min(int(score * 10), 9) / 10
+            telemetry.count("vlm.verdict_by_prefilter_band", f"{band:.1f}-{band + 0.1:.1f}:{verdict}")
+    telemetry.count(f"decisions[{route}]", verdict)
+    telemetry.event(
+        "decisions",
+        {
+            "track": track_id,
+            "prefilter": prefilter,
+            "prefilter_score": None if score is None else round(score, 4),
+            "route": route,
+            "verdict": verdict,
+            "detail": final.detail,
+        },
+    )
+
+
 def make_prefilter(config: ClassifyConfig) -> Classifier | None:
     """The SigLIP pre-filter, or None when ``config.prefilter`` is ``none``."""
     if config.classifier != "vlm" or config.prefilter not in ("negatives", "positives"):
@@ -254,7 +383,12 @@ def make_prefilter(config: ClassifyConfig) -> Classifier | None:
     except (TypeError, ValueError):
         params = {}
     if "vram_reserve_mb" in params:
-        kwargs["vram_reserve_mb"] = 2500
+        kwargs["vram_reserve_mb"] = resolve_vlm_vram_reserve(config)
+    telemetry.note(
+        "prefilter",
+        {"mode": config.prefilter, "model": model, "threshold": threshold,
+         "device": config.prefilter_device, "vlm_model": config.resolved_model},
+    )
     return SiglipClassifier(model, threshold, config.prefilter_device, **kwargs)
 
 
@@ -350,6 +484,11 @@ def classify_snapshots(
     total_pf = len(pending)
 
     def apply(tracklet, decision: Decision) -> None:
+        if siglip is not None:
+            early = siglip_decisions.get(tracklet.track_id)
+            record_decision_metrics(tracklet.track_id, early, decision, prefilter)
+        else:
+            record_decision_metrics(tracklet.track_id, None, decision, prefilter)
         decision = resolve_undecided(decision, cfg.on_undecided)
         tracklet.redact = decision.redact
         tracklet.score = decision.score

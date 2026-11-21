@@ -80,6 +80,13 @@ GPU instead (needs an ffmpeg build with NVENC). `--crf` then sets NVENC's consta
 `--preset` maps to its `p1`-`p7` presets, or you can pass those directly. Output at a given
 quality is a bit larger than libx264's, and NVENC rejects very small frames (under ~145 px).
 
+Which presets are worth it was measured on 5 minutes of real footage (identical redactions
+every time): `--preset veryfast` cut the whole run by ~19% against `medium`, with SSIM 0.994
+against the `medium` output and a smaller file; `faster` saved ~9% at SSIM 0.995. NVENC was
+faster still but its output was 46% larger with SSIM 0.975, so it needs tuning before it is a
+good default. Capping x264's threads makes the tracker faster but the *run* slower (the
+re-encode becomes the long pole), so the encoder is left to use every core.
+
 Each stage is also its own subcommand sharing a `--meta` JSON file, useful for inspecting
 intermediate results:
 
@@ -109,11 +116,48 @@ auto-redact run --video in.mp4 --prompt "person in a suit" --out redacted.mp4 \
 | Model | `gemma3:4b` via ollama (`--model`, `--ollama-url`) | `google/siglip2-base-patch16-224` via transformers (`--model`, `--device`; on `run`: `--classify-device`, since `--device` is for tracking) |
 | How | Asks "does this image show a person matching ...? yes/no" | Scores the thumbnail against the prompt and auto-derived negative labels |
 | Output | `redact` | `redact` and `score` (0-1); redacts if `score >= --threshold` (default 0.5) |
-| Benchmark | 23/24 correct, ~28 s/image | 19/24 correct at 0.5, ~1.7 s/image on CPU (faster on GPU) |
+| Benchmark | 23/24 correct, ~28 s/image on the 4 GB laptop GPU (~0.1 s/image on an RX 7900 XT eGPU, accuracy not re-measured) | 19/24 correct at 0.5, ~1.7 s/image on CPU (faster on GPU) |
 
 Use the VLM for accuracy and subtle attributes; use SigLIP for speed on simple attributes. Its
 default threshold is conservative, and lower values (~0.15-0.3) looked better on the small
 benchmark. See [benchmarks/README.md](benchmarks/README.md).
+
+### Prompt expressions
+
+When a rule is really several conditions, a prompt can be a boolean expression over yes/no
+questions instead of one long description (small models often handle a pile of clauses worse
+than a few short questions):
+
+```yaml
+prompt:
+  all:
+    - "a woman"
+    - any:
+        - "wearing underwear or lingerie"
+        - "bare midriff"
+        - "bare thighs above the knee"
+    - not: "a child"
+```
+
+On the command line, the same rule as JSON (`--prompt '{"all": ["a woman", {"any": [...]}]}'`)
+or as text: `--prompt '"a woman" and ("bare thighs" or "lingerie") and not "a child"'`. In the text
+form every description is quoted; `not` binds tighter than `and`, which binds tighter than
+`or`. A prompt that doesn't start with `{`, a quote, a parenthesis or `not "` is one
+description exactly as before.
+
+- Every leaf is asked as an ordinary positive question; `not` flips the answer in code, so the
+  model is never given a negated question.
+- Evaluation stops as soon as the result is settled, in the order written: `all` at the first
+  "no", `any` at the first "yes". Put the cheapest or most selective leaf first (`"a woman"`
+  settles most men in one call). A leaf the classifier can't decide makes the result undecided
+  unless another leaf already settles it.
+- Cost grows with the leaves actually asked. With the VLM that is one call each; SigLIP
+  (including the `--prefilter`) scores each leaf on its own and compares it with the threshold
+  first, so a `not` means "scores below the threshold". The tree's `score` is a fuzzy
+  combination (min / max / 1 - s) for display and threshold tuning.
+- The verdict's reason lists the leaves that were asked, e.g.
+  `'a woman': yes; 'bare thighs': no (0.20) -> no`, and `stats.json` counts each leaf's answers
+  (`counts["prompt.leaf_verdicts"]`) so you can see which leaves prune and reorder them.
 
 ### Prompt tips
 
@@ -144,6 +188,22 @@ selective: true
 max_gap: 30
 smooth_window: 9
 ```
+### Pans and zooms inside a shot
+
+A person gets one snapshot and one verdict. A camera move without a cut can change what is
+visible inside a single track (hips and thighs, then a pan up to the face), and the snapshot
+that wins is usually the face view, so the earlier part is judged by proxy and can leak.
+`--view-split` (`view_split: true`) watches which body regions the pose model can see (head,
+shoulders, hips, legs) and starts a new tracklet when two or more appear or vanish, so each
+view gets its own snapshot and verdict. The split is placed where the change began, not where
+it was noticed, and the few frames before it are held back from snapshot selection so they
+cannot win on the wrong side. A view shorter than `--view-min-frames` (12 observations) never
+splits; a tail that short (a person leaving as the camera moves) skips its own snapshot and
+inherits the verdict before it, because the renderer drops redacted tracklets under
+`min_track_frames`. `--view-min-regions` (2) sets how large a change counts. It is off by
+default, and turning it on re-tracks (the settings are part of the tracking cache key only
+once changed). `stats.json` counts `view_split` splits and inherited tails.
+
 ## Model choices
 
 - **YOLO11n-pose** detects people with 17 keypoints per frame. The nano model is fast and
@@ -164,6 +224,48 @@ ollama holds `gemma3:4b` (~2.5 GB) on the GPU, SigLIP may not fit next to it. Wi
 back to the CPU (~1.7 s/image). Stop ollama (or let it unload the model) to keep SigLIP on the
 GPU. Everything runs on CPU too, just slower.
 
+### Running the VLM on an eGPU
+
+The VLM stage only talks to ollama over HTTP, so it uses whatever GPU ollama uses; no
+`auto-redact` setting is involved. Putting ollama on a separate GPU (for example an AMD
+RX 7900 XT in a Thunderbolt/USB4 enclosure) frees the laptop GPU's VRAM for YOLO, SigLIP and
+NVENC, which run through PyTorch/CUDA and stay on the NVIDIA card. On the reference setup
+(ThinkPad P16s Gen 2, ADT-Link UT4G enclosure, RX 7900 XT with 20 GB over a 40 Gb/s link),
+`gemma3:4b` answers a yes/no question in about 0.1 s once loaded, and larger VLMs fit
+(`--model`).
+
+On Linux with an AMD card:
+
+1. Install the Vulkan driver: `sudo pacman -S vulkan-radeon lib32-vulkan-radeon` (or your
+   distro's `mesa-vulkan-drivers`). Check `vulkaninfo --summary` lists the card.
+2. Authorize the enclosure if needed (`boltctl list`, `boltctl enroll --policy auto <uuid>`).
+3. Enable ollama's Vulkan backend and pin it to the eGPU, for example with a systemd drop-in
+   (`/etc/systemd/system/ollama.service.d/egpu.conf`):
+
+   ```ini
+   [Service]
+   Environment="OLLAMA_VULKAN=1"
+   Environment="CUDA_VISIBLE_DEVICES=-1"
+   Environment="GGML_VK_VISIBLE_DEVICES=1"
+   ```
+
+   `GGML_VK_VISIBLE_DEVICES` is the Vulkan device index (check the `inference compute` lines in
+   `journalctl -u ollama`); `CUDA_VISIBLE_DEVICES=-1` keeps ollama off the NVIDIA card. Run
+   `sudo systemctl daemon-reload && sudo systemctl restart ollama`, then confirm
+   `ollama ps` shows `100% GPU`. With the eGPU unplugged this configuration falls back to
+   the CPU, so remove the drop-in to go back to the NVIDIA card.
+
+Ollama's ROCm build is an alternative to Vulkan on supported AMD cards.
+
+The SigLIP pre-filter (`--prefilter`) normally keeps ~2.5 GB of VRAM free for the VLM before it
+takes the laptop GPU, which on a 4 GB card pushes it onto the CPU. This is automatic: before
+loading SigLIP, `auto-redact` loads the VLM in ollama and checks whether an ollama process holds
+memory on the NVIDIA GPU (`nvidia-smi`). If ollama runs on another GPU, on the CPU, or on a
+remote host (`--ollama-url`), no VRAM is reserved and the pre-filter uses the NVIDIA GPU. If it
+can't tell (no `nvidia-smi`, ollama unreachable) it reserves as before. Override with
+`--vlm-vram-reserve-mb MB` (`0` never reserves), or force the device with `--prefilter-device 0`.
+The decision is logged (`prefilter: ollama is not using this GPU ...`).
+
 `--encoder h264_nvenc` needs free VRAM for its own CUDA context. On a 4 GB card shared with
 ollama and the SigLIP/YOLO models it can fail with `CUDA_ERROR_OUT_OF_MEMORY`. The staged render
 frees cached GPU memory first, and any NVENC failure falls back to `libx264` with a warning;
@@ -176,7 +278,7 @@ with `--streaming` the other models are still loaded, so the fallback is more li
 | Detection/tracking (YOLO11n-pose + ByteTrack) | GPU if CUDA is available, else CPU; FP16 on CUDA | `--device`, `--no-half` |
 | SigLIP classifier (`--classifier siglip`) | **GPU if available**, else CPU; CPU fallback on CUDA OOM | `--classify-device` on `run`, `--device` on `classify` |
 | SigLIP pre-filter (`--prefilter`) | **GPU if available**, else CPU; CPU fallback on CUDA OOM | `--prefilter-device` |
-| VLM classifier | `gemma3:4b` via ollama (device is ollama's choice) | `--model`, `--ollama-url` |
+| VLM classifier | `gemma3:4b` via ollama (device is ollama's choice, see [Running the VLM on an eGPU](#running-the-vlm-on-an-egpu)) | `--model`, `--ollama-url` |
 | Classifier | `vlm`; SigLIP threshold 0.5 | `--classifier`, `--threshold` |
 | Pre-filter | `none` | `--prefilter {negatives,positives}` |
 | Undecided people (VLM reply with no yes/no, classifier error) | **redacted** | `--on-undecided {redact,keep,error}` |
@@ -186,6 +288,19 @@ with `--streaming` the other models are still loaded, so the fallback is more li
 The device each SigLIP model actually ended up on is logged (`siglip: ... loaded on cuda`) and
 recorded in the run stats.
 
+## Where the time goes
+
+Tracking (detection + ByteTrack), classification and re-encoding run concurrently and the
+slowest sets the pace, so speeding up one stage only helps until another becomes the limit. On a
+5-minute segment the stages were roughly: tracking 138 s, classification 135 s (one worker),
+re-encode the rest. Things that were measured and are *not* worth changing: FP32 instead of FP16
+(slower), a lower `imgsz` (no gain), `--stride 2` (changes results), other trackers (ByteTrack
+gave the fewest, longest tracks), and a different GPU for the tracker (the nano model is
+CPU-bound; a 7900 XT was no faster). Things that were worth doing and are built in: SigLIP scores
+every leaf of a prompt from one image embedding and cached text embeddings (9x faster, identical
+scores), the scene-cut histogram is computed after shrinking the frame, and checkpoint crops are
+written on a background thread.
+
 ## Instrumentation
 
 Every command writes a run directory to `~/.local/state/auto-redact/runs/<timestamp>-<command>/`
@@ -194,7 +309,16 @@ Every command writes a run directory to `~/.local/state/auto-redact/runs/<timest
 - `run.log`: debug log with timestamps and thread names, plus periodic RSS/GPU memory samples.
 - `stats.json`: environment (versions, GPU, ffmpeg), arguments, stage timings, per-operation
   timing aggregates (count/total/mean/max, e.g. `siglip.score[cuda:0]`, `vlm.classify`), peak
-  RSS and GPU memory, the devices used, and any error with its traceback.
+  RSS and GPU memory, the devices used, and any error with its traceback. With a VLM
+  pre-filter it also records how people were decided: `dists` holds the pre-filter score
+  distribution (10 bins over 0-1; `prefilter.score` for everyone, `prefilter.score[sent_to_vlm]`
+  for those handed on), and `counts` holds who decided (`prefilter.routed`), the verdicts per
+  decider (`decisions[prefilter]`, `decisions[vlm]`) and the VLM's verdict per pre-filter score
+  band (`vlm.verdict_by_prefilter_band`, e.g. `0.3-0.4:keep`), which shows whether lowering the
+  pre-filter threshold is finding anything. The `prefilter` note records the mode, model and
+  threshold used.
+- `decisions.jsonl`: one line per decided person (`track`, `prefilter_score`, `route`,
+  `verdict`, the classifier's `detail`), for digging into individual calls.
 
 When reporting a slowdown or odd behavior, attach those two files. Disable with `--no-stats`
 or `AUTO_REDACT_STATS=0`.

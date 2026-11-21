@@ -216,6 +216,22 @@ def _frame_hist(image: np.ndarray) -> np.ndarray:
     return hist
 
 
+def rgb_frame_hist(frame: np.ndarray) -> np.ndarray:
+    """HSV histogram of an RGB frame, for cut detection.
+
+    Shrinks the frame *before* converting its colour order. Both orders give
+    bit-identical histograms (area resampling treats channels independently),
+    but converting a full 1080p frame first costs about 2-3 ms per frame.
+    """
+    height, width = frame.shape[:2]
+    if width > _DETECT_WIDTH:
+        scale = _DETECT_WIDTH / width
+        frame = cv2.resize(
+            frame, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA
+        )
+    return _frame_hist(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+
 def _partition_at_cuts(
     tracklet: Tracklet,
     cuts: list[int],

@@ -10,18 +10,74 @@ from typing import Callable, Iterator
 
 from tqdm import tqdm
 
+
+def format_time(seconds: float | int | None) -> str:
+    """Format a number of seconds as ``M:SS`` (or ``H:MM:SS`` when needed).
+
+    Used to turn frame counts into video time in progress bars. ``None`` and
+    negative values render as ``0:00``.
+    """
+    if seconds is None:
+        seconds = 0
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds < 0 or seconds != seconds:  # NaN guard
+        seconds = 0.0
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+# Aliases / helpers that other callers (and tests) may use for the same thing.
+format_seconds = format_time
+format_duration = format_time
+
+
+def frames_to_time(frames, fps):
+    """Convert a frame count to a formatted video time using ``fps``."""
+    try:
+        fps = float(fps)
+    except (TypeError, ValueError):
+        fps = 0.0
+    if not fps:
+        return format_time(0)
+    return format_time((frames or 0) / fps)
+
+
+class _TimeTqdm(tqdm):
+    """A ``tqdm`` bar that can carry a ``timestr`` field in its format."""
+
+    @property
+    def format_dict(self):  # type: ignore[override]
+        d = super().format_dict
+        d["timestr"] = getattr(self, "timestr", "")
+        return d
+
+
 ProgressCallback = Callable[[int, int], None]
 
 
 @contextlib.contextmanager
-def progress_bar(desc: str, unit: str | None = None, position: int = 0) -> Iterator[ProgressCallback]:
+def progress_bar(
+    desc: str,
+    unit: str | None = None,
+    position: int = 0,
+    fps: float | None = None,
+) -> Iterator[ProgressCallback]:
     """Yield an ``on_progress(done, total)`` callback driving one bar.
 
-    The bar is hidden automatically when stderr isn't a terminal.
+    The bar is hidden automatically when stderr isn't a terminal. When ``fps``
+    is given, ``done``/``total`` are frame counts and an extra ``time/total``
+    field (``M:SS/total``) is shown alongside the frame counter.
     """
     if desc == "prefilter" and position == 0:
         position = 1  # shown under the (not yet advancing) classify bar
-    bar = tqdm(
+    bar = _TimeTqdm(
         desc=desc,
         unit=unit or ("track" if desc in ("classify", "prefilter") else "frame"),
         file=sys.stderr,
@@ -29,9 +85,12 @@ def progress_bar(desc: str, unit: str | None = None, position: int = 0) -> Itera
         dynamic_ncols=True,
         position=position,
         leave=True,
-        bar_format="{desc:<10} {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
-        "[{elapsed}<{remaining}, {rate_fmt}]",
+        bar_format=(
+            "{desc:<10} {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+            "{timestr} [{elapsed}<{remaining}, {rate_fmt}]"
+        ),
     )
+    bar.timestr = ""
 
     def update(done: int, total: int) -> None:
         # Keep the bar's total in sync first so the percentage and the
@@ -46,6 +105,8 @@ def progress_bar(desc: str, unit: str | None = None, position: int = 0) -> Itera
         else:
             # A late/out-of-order report must not leave the bar behind.
             bar.n = done
+        if fps and fps > 0 and total is not None and total >= 0:
+            bar.timestr = f"{format_time((done or 0) / fps)}/{format_time((total or 0) / fps)}"
         try:
             bar.refresh()
         except Exception:

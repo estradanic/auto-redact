@@ -109,3 +109,21 @@ def test_corrupt_manifest_is_treated_as_empty(tmp_path):
 def test_undecided_policy_changes_classification_results(tmp_path):
     base = make_keys(tmp_path)[2]
     assert make_keys(tmp_path, classify=ClassifyConfig(on_undecided="keep"))[2] != base
+
+
+def test_view_split_options_do_not_change_keys_until_enabled(tmp_path):
+    import dataclasses
+
+    from auto_redact.cache import track_key
+    from auto_redact.config import cache_fields
+
+    video = tmp_path / "v.bin"
+    video.write_bytes(b"x")
+    base = TrackConfig()
+    # Added after results were cached: at their defaults they must not
+    # invalidate anything.
+    assert "view_split" not in cache_fields(base)
+    assert "view_min_frames" not in cache_fields(base)
+    on = dataclasses.replace(base, view_split=True)
+    assert track_key(video, on) != track_key(video, base)
+    assert track_key(video, dataclasses.replace(on, view_min_frames=20)) != track_key(video, on)
