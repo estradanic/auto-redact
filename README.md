@@ -301,6 +301,35 @@ every leaf of a prompt from one image embedding and cached text embeddings (9x f
 scores), the scene-cut histogram is computed after shrinking the frame, and checkpoint crops are
 written on a background thread.
 
+### Classification workers and the VLM
+
+On a long episode with many people, classification (not tracking) is usually the slow stage.
+The ollama server answers one vision request at a time (the model runs in a single slot even with
+`OLLAMA_NUM_PARALLEL` raised), and each follow-up question about the *same* image is much cheaper
+than the first because the server keeps the image's encoding (about 0.3 s against 1.1 s per call).
+So the VLM's questions about one image are kept together, and more than one worker helps only by
+overlapping the other per-person work (SigLIP, thumbnails, isolation) with the VLM:
+
+| Pool-scene slice, 7,200 frames | stage time |
+|---|---|
+| 1 worker | 451 s |
+| `--classify-workers 2` | **366 s** (-19%; now bound by the VLM itself) |
+| `--classify-workers 3` | 361 s (no further gain) |
+
+Use 2 workers with the VLM; raising `OLLAMA_NUM_PARALLEL` does not help and, with workers that
+interleave images, made a full episode 84% slower. Verdicts were identical in every setting.
+
+Over a whole episode (62,281 frames, 4,510 tracklets, one long VLM-heavy pool scene) the gain was
+smaller than on the slice: 1,581 s to 1,480 s, with peak memory down from 8.2 GB to 5.0 GB and all
+4,510 verdicts unchanged. Two things limit it: the backlog cap stops tracking from running ahead
+through the quieter minutes while the VLM works through the dense scene (tracking paused for 304 s
+in total), and a second worker's CPU work slows the tracker (12 to 15 ms per frame). A larger
+`--classify-backlog` should trade memory for time; that was not measured.
+`--classify-backlog N` (default 256) pauses tracking while more than N closed tracklets wait for a
+verdict, so a slow classifier cannot pile up snapshot crops in memory (an episode with a long
+crowd scene reached 8-9 GB without it); `0` removes the limit. The run stats show where time is
+spent: `decide.total` (summed over workers), `vlm.lock_wait` and `decide.backpressure_wait`.
+
 ## Instrumentation
 
 Every command writes a run directory to `~/.local/state/auto-redact/runs/<timestamp>-<command>/`

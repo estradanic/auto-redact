@@ -17,6 +17,7 @@ import base64
 import json
 import logging
 import re
+import threading
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -178,10 +179,21 @@ class VlmClassifier:
         self.think = think
         self.keep_alive = keep_alive
         self.max_image_size = max_image_size
+        # A vision model runs in a single server slot, so concurrent requests
+        # queue anyway, and interleaving different images makes every question
+        # re-encode its image (about 3.6x slower per call). Keeping one
+        # image's questions together lets the follow-ups reuse the encoding;
+        # other threads still overlap their non-VLM work meanwhile.
+        self._image_lock = threading.Lock()
 
     def classify(self, image_path: str | Path, prompt: str) -> Decision:
         """Ask about ``prompt``: one question, or one per leaf of a prompt expression."""
-        return evaluate(parse_prompt(prompt), lambda leaf: self._ask(image_path, leaf), "vlm")
+        with telemetry.timed("vlm.lock_wait"):
+            self._image_lock.acquire()
+        try:
+            return evaluate(parse_prompt(prompt), lambda leaf: self._ask(image_path, leaf), "vlm")
+        finally:
+            self._image_lock.release()
 
     def _ask(self, image_path: str | Path, prompt: str) -> Decision:
         with telemetry.timed("vlm.classify"):

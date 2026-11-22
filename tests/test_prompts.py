@@ -162,3 +162,32 @@ def test_vlm_classifier_asks_one_question_per_leaf_and_plain_prompts_stay_one() 
     vlm.questions.clear()
     out = vlm.classify("x.jpg", "a woman")
     assert vlm.questions == ["a woman"] and out.detail == "reply: True"
+
+
+def test_one_images_questions_stay_together_when_workers_run_concurrently() -> None:
+    import threading
+    import time
+
+    log = []
+
+    class Recording(VlmClassifier):
+        def __init__(self):
+            super().__init__()
+
+        def _ask(self, image_path, prompt):
+            log.append((image_path, prompt))
+            time.sleep(0.003)  # long enough for another thread to interleave if it could
+            return Decision(False, None, "reply: no")
+
+    clf = Recording()
+    prompt = '"a" or "b" or "c" or "d"'  # every leaf answers no, so all four are asked
+    threads = [threading.Thread(target=clf.classify, args=(f"img{i}", prompt)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(log) == 24
+    for start in range(0, 24, 4):
+        images = {image for image, _ in log[start:start + 4]}
+        assert len(images) == 1, f"questions interleaved: {log[start:start + 4]}"

@@ -226,10 +226,20 @@ class ClassifyConfig:
     )
     workers: int = _opt(
         1,
-        "vlm only: concurrent ollama requests (default: %(default)s). More "
-        "only helps if the server allows it (set OLLAMA_NUM_PARALLEL on "
-        "the ollama server)",
+        "Concurrent classifications (default: %(default)s). The ollama server "
+        "answers one vision request at a time, so with the VLM extra workers "
+        "do not speed up the questions themselves: they overlap the other "
+        "per-person work (SigLIP, thumbnails) with them",
         flag="--classify-workers",
+        metavar="N",
+        cache=False,
+    )
+    backlog: int = _opt(
+        256,
+        "Streaming: pause tracking while more than N closed tracklets wait "
+        "for a verdict, which bounds memory when classification is the "
+        "slower stage (default: %(default)s; 0 = unlimited)",
+        flag="--classify-backlog",
         metavar="N",
         cache=False,
     )

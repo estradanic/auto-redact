@@ -296,8 +296,10 @@ class _Decider:
     def __init__(self, *, frontier, info, thumbs, prompt, padding, isolate,
                  sub_isolate, closeup_area_fraction, same_person_iou,
                  isolate_dilate, classifier, prefilter_clf, prefilter,
-                 workers, detector=None, on_undecided="redact", view_min_frames=0) -> None:
+                 workers, detector=None, on_undecided="redact", view_min_frames=0,
+                 backlog=0) -> None:
         self.frontier = frontier
+        self.slots = threading.BoundedSemaphore(backlog) if backlog > 0 else None
         self.view_min_frames = view_min_frames
         self.on_undecided = on_undecided
         self.w, self.h = info.width, info.height
@@ -326,9 +328,22 @@ class _Decider:
         self.count_lock = threading.Lock()
 
     def submit(self, track: _Track) -> None:
+        if self.slots is not None:
+            # Backpressure: with more than ``backlog`` closed tracklets still
+            # awaiting a verdict, tracking pauses (each one holds its crop in
+            # memory). Wake up for a fatal error so this can never hang.
+            with telemetry.timed("decide.backpressure_wait"):
+                while not self.slots.acquire(timeout=0.5):
+                    if self.frontier.fatal is not None:
+                        raise self.frontier.fatal
         with self.count_lock:
             self.submitted += 1
-        self.pool.submit(self._run, track)
+        try:
+            self.pool.submit(self._run, track)
+        except BaseException:
+            if self.slots is not None:
+                self.slots.release()
+            raise
 
     def _run(self, track: _Track) -> None:
         try:
@@ -342,6 +357,8 @@ class _Decider:
             self._finish(track, decision)
         finally:
             track.decided.set()
+            if self.slots is not None:
+                self.slots.release()
 
     def _finish(self, track: _Track, decision: Decision) -> None:
         decision = resolve_undecided(decision, self.on_undecided)
@@ -672,6 +689,7 @@ def run_pipeline_streaming(
         prefilter_clf=pre_clf, prefilter=prefilter, workers=classify_workers,
         detector=detector, on_undecided=classify_cfg.on_undecided,
         view_min_frames=track_cfg.view_min_frames if track_cfg.view_split else 0,
+        backlog=classify_cfg.backlog,
     )
 
     if tracker is None:

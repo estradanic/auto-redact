@@ -538,3 +538,52 @@ def test_crop_writer_thread_is_stopped_and_the_checkpoint_cleaned_up(clip, tmp_p
     assert not [t for t in threading.enumerate() if t.name.startswith("crop-save")]
     assert not (tmp_path / "m.json.stream.track.ckpt.json.crops").exists()
     assert not (tmp_path / "m.json.stream.track.ckpt.json").exists()
+
+
+def test_backlog_pauses_tracking_instead_of_letting_undecided_tracks_pile_up(clip, tmp_path, config, monkeypatch):
+    import dataclasses
+    import time
+
+    from auto_redact import streaming
+
+    peak = [0]
+    original = streaming._Decider.submit
+
+    def spy(self, track):
+        original(self, track)
+        peak[0] = max(peak[0], self.submitted - self.completed)
+
+    class Slow(FakeSiglip):
+        def classify(self, path, prompt):
+            time.sleep(0.15)
+            return super().classify(path, prompt)
+
+    monkeypatch.setattr(streaming._Decider, "submit", spy)
+    monkeypatch.setattr("auto_redact.siglip.SiglipClassifier", Slow)
+    capped = dataclasses.replace(config, classify=dataclasses.replace(config.classify, backlog=1))
+    run_pipeline_streaming(clip, "person", tmp_path / "out.mp4", capped,
+                           meta_path=tmp_path / "m.json", thumbs_dir=tmp_path / "thumbs",
+                           tracker=ScriptedTracker())
+
+    assert peak[0] == 1  # never more than one undecided, and the run still finishes with both verdicts
+    meta = load_meta(tmp_path / "m.json")
+    assert [t.redact for t in meta.tracklets] == [True, False]
+
+
+def test_a_failure_while_tracking_is_paused_by_the_backlog_does_not_hang(clip, tmp_path, config, monkeypatch):
+    import dataclasses
+
+    from auto_redact import streaming
+
+    class Boom(FakeSiglip):
+        def classify(self, path, prompt):
+            raise RuntimeError("classifier exploded")
+
+    monkeypatch.setattr("auto_redact.siglip.SiglipClassifier", Boom)
+    capped = dataclasses.replace(
+        config, classify=dataclasses.replace(config.classify, backlog=1, on_undecided="error")
+    )
+    with pytest.raises(Exception):
+        run_pipeline_streaming(clip, "person", tmp_path / "out.mp4", capped,
+                               meta_path=tmp_path / "m.json", thumbs_dir=tmp_path / "thumbs",
+                               tracker=ScriptedTracker())
