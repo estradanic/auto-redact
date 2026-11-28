@@ -118,7 +118,7 @@ def test_parse_yes_no(reply, expected) -> None:
 def test_build_question_embeds_prompt() -> None:
     assert build_question("person in a red shirt") == (
         "Does this image show a person matching: 'person in a red shirt'? "
-        "Answer yes or no."
+        "Reply with only 'yes' or 'no'."
     )
 
 

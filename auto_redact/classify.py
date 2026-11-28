@@ -47,7 +47,8 @@ GENERATION_OPTIONS = {"num_predict": 8, "temperature": 0, "num_ctx": 4096}
 THINKING_NUM_PREDICT = 2048
 
 PROMPT_TEMPLATE = (
-    "Does this image show a person matching: '{prompt}'? Answer yes or no."
+    "Does this image show a person matching: '{prompt}'? "
+    "Reply with only 'yes' or 'no'."
 )
 
 _YES_NO = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
